@@ -560,6 +560,15 @@ class CaptureWorker:
         self.noise_warned_at = 0.0
         self.last_1s_uA: Optional[float] = None
         self.size_mismatch_warned = False
+        self._reset_logic_stats()
+        self.prev_bits_byte: Optional[int] = None
+
+    def _reset_logic_stats(self) -> None:
+        """Per-channel activity of D0-D7 since the last live message."""
+        self.logic_edges = np.zeros(8, dtype=np.int64)
+        self.logic_or = 0
+        self.logic_and = 0xFF
+        self.logic_samples = 0
 
     # -- main loop --
 
@@ -810,6 +819,7 @@ class CaptureWorker:
             self._loss(n0 + i, lost, "counter", t_now)
 
         self.hist.write(n0, cur, bits)
+        self._logic_stats(bits)
 
         rises, pulses, noise = self.pulses.feed(n0, (bits & D7_MASK) != 0)
         if noise:
@@ -833,6 +843,22 @@ class CaptureWorker:
 
         if self.rec is not None:
             self.rec.feed(n0, cur)
+
+    def _logic_stats(self, bits: np.ndarray) -> None:
+        """Edges and levels on every logic channel, to show in the GUI which
+        of D0-D7 actually sees a signal (wiring check)."""
+        if bits.size == 0:
+            return
+        seq = bits if self.prev_bits_byte is None else np.concatenate(
+            (np.array([self.prev_bits_byte], dtype=np.uint8), bits))
+        changed = np.bitwise_xor(seq[1:], seq[:-1])
+        if changed.any():
+            self.logic_edges += np.unpackbits(changed[changed != 0][:, None], axis=1,
+                                              bitorder="little").sum(axis=0, dtype=np.int64)
+        self.logic_or |= int(np.bitwise_or.reduce(bits))
+        self.logic_and &= int(np.bitwise_and.reduce(bits))
+        self.logic_samples += int(bits.size)
+        self.prev_bits_byte = int(bits[-1])
 
     def _on_rise(self, n_rise: int) -> None:
         self.rise_count += 1
@@ -895,7 +921,10 @@ class CaptureWorker:
             "g_max": (np.concatenate(self.live_max) if self.live_max
                       else np.empty(0, np.float32)),
             "rec": None,
+            "logic": {"edges": self.logic_edges.tolist(), "or": self.logic_or,
+                      "and": self.logic_and, "samples": self.logic_samples},
         }
+        self._reset_logic_stats()
         self.live_n0 = None
         self.live_mean, self.live_max = [], []
         if self.rec is not None:
@@ -906,6 +935,7 @@ class CaptureWorker:
                 "charge_uC": r.total_sum * SAMPLE_PERIOD_S,
                 "seconds": r.take_seconds(),
                 "snippets": r.snippets,
+                "losses": r.losses,
             }
         self._send("live", msg)
 

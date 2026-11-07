@@ -57,12 +57,31 @@ The firmware and the PPK2 wiring come from the matching repos: ULP_FALL (ESP32-S
 py vimu_ppk2_run_app.py --stm32-port COM19 --ppk2-port COM17 --npz "..\Tool_send_data_fall_numpy\P01_S01_SA06_typical_day.npz"
 ```
 
-1. Click **Connect** for the STM32, then **Connect** for the PPK2. The PPK2 starts measuring with DUT power OFF.
+1. Click **Connect** for the STM32, then **Connect** for the PPK2. The PPK2 starts measuring with DUT power OFF. You can pick a port from the list, which refreshes each time it opens, or type it: `19`, `com19` and `COM19` all mean COM19.
 2. Click **DUT ON**, then wait until the ESP32 has booted. Once the ESP32 has configured the sensor, the STM32 card shows `RUNNING`.
-3. Set **Start** and **Duration** (`hh:mm:ss`). Loading a file fills Duration with its full length (24:00:00).
-4. Click **▶ START RUN**. The run stops by itself after the last sample has played, plus a 5 s tail. **■ STOP RUN** stops it early, after a confirmation. The data recorded so far is kept and analysed.
+3. Set **Start** and **Duration**. Each has three boxes, hours : minutes : seconds. Type the digits into a box, or use its arrows, the Up/Down keys or the mouse wheel. Loading a file fills Duration with the file's full length (24:00:00). The port and time boxes are locked while a run is active.
+4. Click **▶ START RUN**. The run stops by itself after the last sample has played, plus a 5 s tail, and its files are kept and analysed.
+
+**■ STOP RUN** stops a run early. It asks what to do with the files:
+- **Stop & save** keeps the files recorded so far and analyses them.
+- **Stop & discard** deletes the run's folder. For a run longer than 5 minutes the app asks once more before deleting.
+- **Keep running** closes the dialog and the run continues.
+
+Closing the window during a run asks the same question, then quits.
+
+On a small screen the app opens maximised. The stats panel on the right scrolls with the mouse wheel, and its scrollbar only shows when the panel is cut. The bar above the D7 table and log is a divider: drag it down to give the plots and stats more room.
 
 Do not switch DUT power on as part of the run. On boot the ESP32 writes `CTRL_REG1` standby and then active, which stops and restarts the STM32 in the middle of the run. If DUT power was switched on less than 5 s before START RUN, the app asks before starting.
+
+## Auto-save
+
+Tick **Auto-save every** in the run bar and set the interval (h : m : s, default 1:00:00, minimum 1 minute). Alternatively, start the app with `--autosave 1:00:00`. You can switch it on or off and change the interval during a run.
+
+The measurement files are always written to disk as the run goes. Auto-save adds the analysis: at every interval of run time (1 h, 2 h, …) the app analyses the data recorded so far. If the PC or the app dies part-way through a 24 h run, the results up to the last checkpoint are already on disk. Each snapshot writes:
+- `summary.txt`, `summary.json` and `d7_events.csv` in the run folder, overwritten with the latest snapshot;
+- `checkpoints/<01h00m00s>_summary.txt` and `.json`, one pair per snapshot, kept.
+
+The snapshot runs `analyze_run.py` in a separate process, so it does not slow the PPK2 or STM32 threads. It covers data up to about 10 s before the snapshot. The final analysis at the end of the run replaces the latest files. The `Auto-save` line in the RUN panel shows the time to the next snapshot and how many have been saved. **Stop & discard** deletes the checkpoints with the rest of the run.
 
 ## What START RUN does
 
@@ -144,6 +163,7 @@ py analyze_run.py runs\20261107_201500 --tolerance 5 --warmup 4
 | `--min-pulse-us` | 200 | Shorter D7 pulses are glitches |
 | `--boot-wait` | 5.0 | Ask before START if DUT power is more recent than this (s) |
 | `--runs-dir` | `runs` | Output folder |
+| `--autosave` | off | Auto-save interval, e.g. `1:00:00` |
 
 ## Faults during a run
 

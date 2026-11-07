@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import math
+import shutil
 from collections import Counter
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -33,10 +35,16 @@ EVENT_HEADER = [
 
 
 def _read_csv(path: Path) -> List[dict]:
+    """Read a CSV that may still be written to (auto-save checkpoints run
+    during a run): a last line without its newline is dropped, and so is any
+    row with missing or extra fields."""
     if not path.exists():
         return []
-    with open(path, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if text and not text.endswith("\n"):
+        text = text[:text.rfind("\n") + 1]
+    rows = csv.DictReader(io.StringIO(text))
+    return [r for r in rows if None not in r and None not in r.values()]
 
 
 def _stats(values) -> dict:
@@ -50,7 +58,9 @@ def _stats(values) -> dict:
 
 def analyze(run_dir, npz: Optional[rs.NpzRunData] = None,
             tolerance_s: Optional[float] = None, warmup_s: Optional[float] = None,
-            log: Callable[[str], None] = print) -> dict:
+            log: Callable[[str], None] = print, checkpoint: str = "") -> dict:
+    """checkpoint: a label such as '01h00m00s' when called during a run; the
+    summary is then also copied to checkpoints/<label>_summary.*"""
     run_dir = Path(run_dir)
     session = json.loads((run_dir / "session.json").read_text(encoding="utf-8"))
     run = session["run"]
@@ -196,6 +206,7 @@ def analyze(run_dir, npz: Optional[rs.NpzRunData] = None,
     summary = {
         "run_dir": str(run_dir),
         "status": session.get("status", ""),
+        "checkpoint": checkpoint,
         "npz": session["npz"]["path"],
         "start_idx": start, "end_idx": end,
         "scenario": f"{rs.fmt_hms(start / RATE)} - {rs.fmt_hms(end / RATE)}",
@@ -220,6 +231,11 @@ def analyze(run_dir, npz: Optional[rs.NpzRunData] = None,
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     text = format_summary(summary)
     (run_dir / "summary.txt").write_text(text, encoding="utf-8")
+    if checkpoint:
+        ck = run_dir / "checkpoints"
+        ck.mkdir(exist_ok=True)
+        shutil.copyfile(run_dir / "summary.txt", ck / f"{checkpoint}_summary.txt")
+        shutil.copyfile(run_dir / "summary.json", ck / f"{checkpoint}_summary.json")
     log(text)
     return summary
 
@@ -227,8 +243,9 @@ def analyze(run_dir, npz: Optional[rs.NpzRunData] = None,
 def format_summary(s: dict) -> str:
     d7, sync, cur, ppk = s["d7"], s["sync"], s["current"], s["ppk2"]
     v = d7["verdicts"]
+    ck = f"  (checkpoint {s['checkpoint']}, run still going)" if s.get("checkpoint") else ""
     lines = [
-        f"Run {s['run_dir']}  [{s['status']}]",
+        f"Run {s['run_dir']}  [{s['status']}]{ck}",
         f"NPZ {s['npz']}",
         f"Scenario {s['scenario']}   wall clock {s['wall_start']} -> {s['wall_stop']}",
         "",
@@ -286,8 +303,11 @@ def main() -> None:
     ap.add_argument("run_dir")
     ap.add_argument("--tolerance", type=float, help="seconds after a fall still counted as TP")
     ap.add_argument("--warmup", type=float, help="seconds at the start not scored")
+    ap.add_argument("--checkpoint", default="",
+                    help="label for a snapshot taken during a run (used by auto-save)")
     args = ap.parse_args()
-    analyze(args.run_dir, tolerance_s=args.tolerance, warmup_s=args.warmup)
+    analyze(args.run_dir, tolerance_s=args.tolerance, warmup_s=args.warmup,
+            checkpoint=args.checkpoint)
 
 
 if __name__ == "__main__":

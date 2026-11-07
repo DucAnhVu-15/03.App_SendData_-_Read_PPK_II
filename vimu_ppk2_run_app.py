@@ -24,6 +24,9 @@ import json
 import math
 import os
 import queue
+import shutil
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -44,6 +47,7 @@ from run_sync import vimu
 
 APP_DIR = Path(__file__).resolve().parent
 RATE = rs.RATE_HZ
+AUTOSAVE_MIN_S = 60  # shortest auto-save interval; each snapshot re-reads the run files
 
 C_APP, C_BG, C_HEADER = vimu.C_APP, vimu.C_BG, vimu.C_HEADER
 C_PANEL, C_PANEL_2, C_PANEL_3 = vimu.C_PANEL, vimu.C_PANEL_2, vimu.C_PANEL_3
@@ -73,6 +77,78 @@ def keep_awake(on: bool) -> None:
         pass
 
 
+def normalize_port(text: str) -> str:
+    """'19', 'com19', ' COM19 ' -> 'COM19'. Anything else is passed through."""
+    t = text.strip().replace(" ", "")
+    if t.isdigit():
+        return f"COM{t}"
+    if t[:3].upper() == "COM":
+        return "COM" + t[3:]
+    return t
+
+
+class HmsInput(tk.Frame):
+    """Hours : minutes : seconds as three spin boxes. Each box takes typed
+    digits, the arrows, the Up/Down keys or the mouse wheel."""
+
+    def __init__(self, parent: tk.Widget, hours_max: int = 99) -> None:
+        super().__init__(parent, bg=C_PANEL)
+        self.hours_max = hours_max
+        self._boxes = []
+        check = (self.register(lambda p: p == "" or (p.isdigit() and len(p) <= 2)), "%P")
+        for i, top in enumerate((hours_max, 59, 59)):
+            if i:
+                tk.Label(self, text=":", bg=C_PANEL, fg=C_SUB, font=FONT_MONO).pack(side="left")
+            var = tk.StringVar(value="00")
+            box = tk.Spinbox(
+                self, from_=0, to=top, wrap=True, width=3, textvariable=var, format="%02.0f",
+                justify="center", font=FONT_MONO, bg=C_FIELD, fg=C_TEXT, insertbackground=C_TEXT,
+                buttonbackground=C_PANEL_2, relief="flat", highlightthickness=1,
+                highlightbackground=C_BORDER, highlightcolor=C_BLUE, disabledbackground=C_PANEL_2,
+                disabledforeground=C_DIM, validate="key", validatecommand=check)
+            box.bind("<FocusOut>", lambda _e, k=i: self._clamp(k))
+            box.bind("<Return>", lambda _e, k=i: self._clamp(k))
+            box.bind("<MouseWheel>", lambda e, b=box: self._wheel(b, e))
+            box.pack(side="left")
+            self._boxes.append((box, var, top))
+
+    @staticmethod
+    def _wheel(box: tk.Spinbox, event) -> str:
+        if str(box.cget("state")) == "normal":
+            box.invoke("buttonup" if event.delta > 0 else "buttondown")
+        return "break"
+
+    def _clamp(self, k: int) -> int:
+        _box, var, top = self._boxes[k]
+        text = var.get().strip()
+        value = min(int(text), top) if text.isdigit() else 0
+        var.set(f"{value:02d}")
+        return value
+
+    def seconds(self) -> int:
+        h, m, s = (self._clamp(k) for k in range(3))
+        return h * 3600 + m * 60 + s
+
+    def peek_seconds(self) -> int:
+        """Current value without re-writing the boxes (safe while typing)."""
+        total = 0
+        for (_box, var, top), mult in zip(self._boxes, (3600, 60, 1)):
+            text = var.get().strip()
+            total += (min(int(text), top) if text.isdigit() else 0) * mult
+        return total
+
+    def set_seconds(self, seconds: float) -> None:
+        total = max(0, int(round(seconds)))
+        h = min(total // 3600, self.hours_max)
+        values = (h, (total % 3600) // 60, total % 60)
+        for (_box, var, _top), v in zip(self._boxes, values):
+            var.set(f"{v:02d}")
+
+    def set_state(self, state: str) -> None:
+        for box, _var, _top in self._boxes:
+            box.config(state=state)
+
+
 def fmt_current(ua: Optional[float]) -> str:
     if ua is None or not math.isfinite(ua):
         return "--"
@@ -82,6 +158,29 @@ def fmt_current(ua: Optional[float]) -> str:
     if a >= 1:
         return f"{ua:.2f} µA"
     return f"{ua * 1000:.0f} nA"
+
+
+def logic_states(window) -> str:
+    """D0..D7 over the recent live messages: T = toggled, H = always high,
+    L = always low, ? = no data."""
+    window = [w for w in window if w and w.get("samples")]
+    if not window:
+        return "????????"
+    edges = np.sum([w["edges"] for w in window], axis=0)
+    ever_high = 0
+    always_high = 0xFF
+    for w in window:
+        ever_high |= w["or"]
+        always_high &= w["and"]
+    out = []
+    for ch in range(8):
+        if edges[ch] > 0:
+            out.append("T")
+        elif always_high >> ch & 1:
+            out.append("H")
+        else:
+            out.append("L" if not ever_high >> ch & 1 else "T")
+    return "".join(out)
 
 
 def _decade_label(d: int) -> str:
@@ -282,9 +381,13 @@ class RunState:
     stm_stopped: bool = False
     ppk_stopped: bool = False
     status: str = ""
+    discard: bool = False
     detected: set = field(default_factory=set)
     counts: dict = field(default_factory=dict)
     loss_logged_at: float = 0.0
+    last_ckpt: float = 0.0          # t_run of the last auto-save snapshot
+    ckpt_count: int = 0
+    last_ckpt_label: str = ""
 
     @property
     def length(self) -> int:
@@ -320,6 +423,7 @@ class RunApp:
         self.dut_on_at: Optional[float] = None
         self.ppk_live: dict = {}
         self.recent_blocks: deque = deque(maxlen=100)   # 10 ms means -> 1 s average
+        self.logic_window: deque = deque(maxlen=40)     # 10 s of live messages
         self.rec_stats: Optional[dict] = None
         self._idle_pulse_logged_at = 0.0
 
@@ -334,6 +438,10 @@ class RunApp:
         self._last_ui = 0.0
         self._last_overview = 0.0
         self._last_pulse_text = "--"
+        self._lock_state: Optional[str] = None
+        self._ckpt_proc: Optional[subprocess.Popen] = None
+        self._ckpt_run: Optional[RunState] = None
+        self._ckpt_label = ""
 
         self._build_ui()
         self._refresh_ports()
@@ -347,8 +455,18 @@ class RunApp:
     def _build_ui(self) -> None:
         self.root.title("VIMU × PPK2 HIL Run")
         self.root.configure(bg=C_APP)
-        self.root.geometry("1440x920")
-        self.root.minsize(1200, 760)
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        small = sw < 1480 or sh < 1000
+        if small:
+            # Laptop screens: fill the screen instead of opening partly off it.
+            self.root.geometry(f"{min(1440, sw - 20)}x{min(920, sh - 80)}+0+0")
+            try:
+                self.root.state("zoomed")
+            except tk.TclError:
+                pass
+        else:
+            self.root.geometry("1440x920")
+        self.root.minsize(1150, 600)
 
         header = tk.Frame(self.root, bg=C_HEADER)
         header.pack(fill="x")
@@ -365,18 +483,22 @@ class RunApp:
         self._build_connections(body)
         self._build_runbar(body)
 
-        middle = tk.Frame(body, bg=C_APP)
-        middle.pack(fill="both", expand=True, pady=(6, 0))
+        # Plots/stats above, D7 table/log below, with a draggable divider.
+        panes = tk.PanedWindow(body, orient="vertical", bg=C_BORDER, bd=0, sashwidth=7,
+                               sashrelief="flat", showhandle=False, opaqueresize=True,
+                               sashcursor="sb_v_double_arrow")
+        self._panes = panes
+        panes.pack(fill="both", expand=True, pady=(6, 0))
+        middle = tk.Frame(panes, bg=C_APP)
         middle.columnconfigure(0, weight=1)
         middle.rowconfigure(0, weight=1)
         self._build_plots(middle)
         self._build_stats(middle)
-
-        bottom = tk.Frame(body, bg=C_APP, height=230)
-        bottom.pack(fill="both", pady=(6, 0))
-        bottom.pack_propagate(False)
+        bottom = tk.Frame(panes, bg=C_APP)
         self._build_table(bottom)
         self._build_log(bottom)
+        panes.add(middle, minsize=160, stretch="always")
+        panes.add(bottom, minsize=90, height=170 if small else 230, stretch="never")
 
         status = tk.Frame(self.root, bg=C_HEADER)
         status.pack(fill="x", side="bottom")
@@ -419,8 +541,9 @@ class RunApp:
         card, inner = self._card(row, "STM32 VIMU  (USART1)")
         card.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
         self.stm_port_var = tk.StringVar(value=self.args.stm32_port)
+        # Editable: pick from the list or type e.g. "19" / "COM19".
         self.stm_port_cb = ttk.Combobox(inner, textvariable=self.stm_port_var, width=10,
-                                        style="Vimu.TCombobox")
+                                        style="Vimu.TCombobox", postcommand=self._refresh_ports)
         self.stm_port_cb.grid(row=0, column=0, padx=(0, 6))
         self._btn(inner, "↻", self._refresh_ports, C_SUB).grid(row=0, column=1, padx=(0, 6))
         self.stm_btn = self._btn(inner, "Connect", self._stm_toggle, C_BLUE, width=10)
@@ -434,7 +557,7 @@ class RunApp:
         card.grid(row=0, column=1, sticky="nsew", padx=5)
         self.ppk_port_var = tk.StringVar(value=self.args.ppk2_port or "")
         self.ppk_port_cb = ttk.Combobox(inner, textvariable=self.ppk_port_var, width=10,
-                                        style="Vimu.TCombobox")
+                                        style="Vimu.TCombobox", postcommand=self._refresh_ports)
         self.ppk_port_cb.grid(row=0, column=0, padx=(0, 6))
         self.mv_var = tk.StringVar(value=str(self.args.voltage))
         self.mv_entry = self._entry(inner, self.mv_var, 6)
@@ -452,18 +575,19 @@ class RunApp:
         card, inner = self._card(row, "NPZ recording")
         card.grid(row=0, column=2, sticky="nsew", padx=(5, 0))
         self.npz_btn = self._btn(inner, "Load NPZ…", self._pick_npz, C_PURPLE)
-        self.npz_btn.grid(row=0, column=0, padx=(0, 8))
-        self._label(inner, "Start").grid(row=0, column=1)
-        self.start_var = tk.StringVar(value="00:00:00")
-        self.start_entry = self._entry(inner, self.start_var, 9)
-        self.start_entry.grid(row=0, column=2, padx=(4, 8))
-        self._label(inner, "Duration").grid(row=0, column=3)
-        self.dur_var = tk.StringVar(value="24:00:00")
-        self.dur_entry = self._entry(inner, self.dur_var, 9)
-        self.dur_entry.grid(row=0, column=4, padx=(4, 0))
+        self.npz_btn.grid(row=0, column=0, rowspan=2, padx=(0, 14), sticky="w")
+        self._label(inner, "Start").grid(row=0, column=1, sticky="w")
+        self.start_in = HmsInput(inner)
+        self.start_in.grid(row=0, column=2, sticky="w", padx=(8, 0), pady=(0, 3))
+        self._label(inner, "Duration").grid(row=1, column=1, sticky="w")
+        self.dur_in = HmsInput(inner)
+        self.dur_in.set_seconds(24 * 3600)
+        self.dur_in.grid(row=1, column=2, sticky="w", padx=(8, 0))
+        self._label(inner, "h : m : s", fg=C_DIM, font=FONT_UI_XS).grid(
+            row=0, column=3, rowspan=2, sticky="w", padx=(8, 0))
         self.npz_info_var = tk.StringVar(value="no file loaded")
         self._label(inner, textvariable=self.npz_info_var, fg=C_DIM, font=FONT_MONO_SM,
-                    anchor="w").grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
+                    anchor="w").grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
     def _build_runbar(self, parent: tk.Widget) -> None:
         bar = tk.Frame(parent, bg=C_PANEL, highlightthickness=1, highlightbackground=C_BORDER)
@@ -475,6 +599,20 @@ class RunApp:
         self.ready_var = tk.StringVar()
         tk.Label(bar, textvariable=self.ready_var, bg=C_PANEL, fg=C_SUB,
                  font=FONT_MONO, anchor="w").pack(side="left", padx=10)
+
+        # Auto-save: every interval, analyse the data so far into summary.*
+        # and checkpoints/<time>_summary.*, without interrupting the run.
+        auto = tk.Frame(bar, bg=C_PANEL)
+        auto.pack(side="left", padx=(18, 0))
+        autosave_s = getattr(self.args, "autosave_s", 0)
+        self.autosave_var = tk.BooleanVar(value=autosave_s > 0)
+        tk.Checkbutton(auto, text="Auto-save every", variable=self.autosave_var,
+                       bg=C_PANEL, fg=C_SUB, activebackground=C_PANEL, activeforeground=C_TEXT,
+                       selectcolor=C_FIELD, font=FONT_UI_SM, bd=0, highlightthickness=0,
+                       cursor="hand2").pack(side="left")
+        self.autosave_in = HmsInput(auto)
+        self.autosave_in.set_seconds(autosave_s or 3600)
+        self.autosave_in.pack(side="left", padx=(6, 0))
         self._btn(bar, "Open run folder", self._open_folder, C_SUB).pack(side="right", padx=10)
         self.window_var = tk.StringVar(value="60 s")
         cb = ttk.Combobox(bar, textvariable=self.window_var, width=7, state="readonly",
@@ -494,15 +632,44 @@ class RunApp:
         self.overview.pack(fill="x", padx=8, pady=(0, 8))
 
     def _build_stats(self, parent: tk.Widget) -> None:
-        frame = tk.Frame(parent, bg=C_PANEL, highlightthickness=1, highlightbackground=C_BORDER,
+        # Scrollable: on a short screen the panel is cut, so its content sits
+        # in a canvas with a scrollbar that only shows when needed.
+        outer = tk.Frame(parent, bg=C_PANEL, highlightthickness=1, highlightbackground=C_BORDER,
                          width=400)
-        frame.grid(row=0, column=1, sticky="nsew")
-        frame.grid_propagate(False)
+        outer.grid(row=0, column=1, sticky="nsew")
+        outer.grid_propagate(False)
+        outer.rowconfigure(0, weight=1)
+        outer.columnconfigure(0, weight=1)
+        canvas = tk.Canvas(outer, bg=C_PANEL, highlightthickness=0, bd=0, yscrollincrement=20)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        bar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
+        frame = tk.Frame(canvas, bg=C_PANEL)
+        win = canvas.create_window(0, 0, window=frame, anchor="nw")
+
+        def update_region(_event=None) -> None:
+            canvas.configure(scrollregion=(0, 0, frame.winfo_reqwidth(), frame.winfo_reqheight()))
+            if frame.winfo_reqheight() > canvas.winfo_height() + 1:
+                bar.grid(row=0, column=1, sticky="ns")
+            else:
+                bar.grid_remove()
+                canvas.yview_moveto(0)
+
+        def on_canvas(event) -> None:
+            canvas.itemconfigure(win, width=event.width)
+            update_region()
+
+        frame.bind("<Configure>", update_region)
+        canvas.bind("<Configure>", on_canvas)
+        self._stats_canvas = canvas
+        self._stats_bar = bar
+        self.root.bind_all("<MouseWheel>", self._on_wheel, add="+")
+
         self.stat_vars: dict = {}
         self.stat_lbls: dict = {}
         sections = [
             ("RUN", [("elapsed", "Elapsed"), ("scenario", "NPZ time"), ("progress", "Progress"),
-                     ("eta", "Remaining"), ("activity", "Activity")]),
+                     ("eta", "Remaining"), ("activity", "Activity"), ("autosave", "Auto-save")]),
             ("SYNC", [("stm", "STM32"), ("played", "Played"), ("drift", "Drift vs 50 Hz"),
                       ("rtt", "UPDATE RTT")]),
             ("PPK2", [("live", "Live (1 s)"), ("avg", "Run average"), ("charge", "Charge"),
@@ -514,7 +681,7 @@ class RunApp:
         for title, items in sections:
             tk.Label(frame, text=title, bg=C_PANEL, fg=C_BLUE, font=FONT_UI_XS,
                      anchor="w").grid(row=r, column=0, columnspan=2, sticky="w",
-                                      padx=12, pady=(8 if r else 6, 2))
+                                      padx=12, pady=(6 if r else 4, 0))
             r += 1
             for key, label in items:
                 tk.Label(frame, text=label, bg=C_PANEL, fg=C_DIM, font=FONT_UI_SM,
@@ -527,6 +694,21 @@ class RunApp:
                 self.stat_lbls[key] = lbl
                 r += 1
         frame.columnconfigure(1, weight=1)
+
+    def _on_wheel(self, event) -> None:
+        """Mouse wheel anywhere over the stats panel scrolls it. The h:m:s
+        boxes handle their own wheel and stop it before it reaches here."""
+        if not self._stats_bar.winfo_ismapped():
+            return
+        try:
+            w = self.root.winfo_containing(event.x_root, event.y_root)
+        except (KeyError, tk.TclError):  # e.g. over an open combobox list
+            return
+        while w is not None:
+            if w is self._stats_canvas:
+                self._stats_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+                return
+            w = w.master
 
     def _build_table(self, parent: tk.Widget) -> None:
         frame = tk.Frame(parent, bg=C_PANEL, highlightthickness=1, highlightbackground=C_BORDER)
@@ -637,9 +819,10 @@ class RunApp:
         self._stm_start_thread()
 
     def _stm_start_thread(self) -> None:
-        port = self.stm_port_var.get().strip()
+        port = normalize_port(self.stm_port_var.get())
         if not port:
             return
+        self.stm_port_var.set(port)
         self.stm = rs.RunMonitorThread(port, self.args.baud, self.args.poll, self.sq, self.lq,
                                        refill_threshold_s=self.args.refill_threshold)
         if self.npz is not None:
@@ -686,10 +869,11 @@ class RunApp:
         except ValueError:
             messagebox.showerror("PPK2", "Voltage must be a whole number of mV")
             return
-        port = self.ppk_port_var.get().strip()
+        port = normalize_port(self.ppk_port_var.get())
         if not port:
-            messagebox.showerror("PPK2", "Select the PPK2 port (COM17 here)")
+            messagebox.showerror("PPK2", "Select or type the PPK2 port (COM17 here)")
             return
+        self.ppk_port_var.set(port)
         self.ppk_info_var.set(f"connecting to {port}…")
         self.ppk_mv = mv
         self.ppk.send("connect", port, mv)
@@ -732,8 +916,8 @@ class RunApp:
         name = Path(data.path).name
         self.npz_info_var.set(f"{name}  ·  {data.n:,} samples  ·  {hours:.2f} h  ·  "
                               f"{len(data.episodes)} falls")
-        self.start_var.set("00:00:00")
-        self.dur_var.set(rs.fmt_hms(data.n / RATE))
+        self.start_in.set_seconds(0)
+        self.dur_in.set_seconds(data.n / RATE)
         if self.stm is not None:
             self.stm.set_data_source(data.samples, data.fall_ids)
         self._log(f"[APP] NPZ loaded: {name}, {data.n:,} samples at {RATE} Hz ({hours:.2f} h), "
@@ -750,10 +934,58 @@ class RunApp:
 
     def _start_or_stop(self) -> None:
         if self.phase in ACTIVE_PHASES:
-            if messagebox.askyesno("Stop run", "Stop the run now? Data so far is kept and analysed."):
-                self._stop_run("stopped")
+            choice = self._ask_stop_choice(
+                "Stop run", "Stop the run now?\n\n"
+                "Save: keep the files and analyse them.\n"
+                f"Discard: delete this run's folder ({self.run.run_dir.name}).")
+            if choice == "cancel" or (choice == "discard" and not self._confirm_discard()):
+                return
+            self._stop_run("stopped", discard=choice == "discard")
         elif self.phase in ("IDLE", "DONE"):
             self._start_run()
+
+    def _ask_stop_choice(self, title: str, message: str) -> str:
+        """Modal dialog: returns 'save', 'discard' or 'cancel'."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title(title)
+        dlg.configure(bg=C_PANEL)
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        result = {"choice": "cancel"}
+
+        def choose(value: str) -> None:
+            result["choice"] = value
+            dlg.destroy()
+
+        tk.Label(dlg, text=message, bg=C_PANEL, fg=C_TEXT, font=FONT_UI, justify="left",
+                 wraplength=460).pack(padx=22, pady=(18, 14), anchor="w")
+        row = tk.Frame(dlg, bg=C_PANEL)
+        row.pack(fill="x", padx=16, pady=(0, 16))
+        self._btn(row, "Stop & save", lambda: choose("save"), C_GREEN).pack(side="left", padx=4)
+        self._btn(row, "Stop & discard", lambda: choose("discard"), C_RED).pack(side="left", padx=4)
+        self._btn(row, "Keep running", lambda: choose("cancel"), C_SUB).pack(side="right", padx=4)
+        dlg.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
+        dlg.bind("<Escape>", lambda _e: choose("cancel"))
+        dlg.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_height()) // 3
+        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        dlg.grab_set()
+        dlg.focus_set()
+        self.root.wait_window(dlg)
+        return result["choice"]
+
+    def _confirm_discard(self) -> bool:
+        """Second question before throwing away more than a few minutes of data."""
+        run = self.run
+        if run is None or run.t_go is None:
+            return True
+        elapsed = time.perf_counter() - run.t_go
+        if elapsed < 300:
+            return True
+        return messagebox.askyesno(
+            "Discard run", f"Delete {rs.fmt_hms(elapsed)} of recorded data permanently?",
+            icon="warning", default="no")
 
     def _start_run(self) -> None:
         missing = [name for name, ok in self._ready_items() if not ok]
@@ -761,12 +993,8 @@ class RunApp:
             messagebox.showwarning("Not ready", "Missing: " + ", ".join(missing))
             return
         npz = self.npz
-        try:
-            start_s = rs.parse_hms(self.start_var.get())
-            dur_s = rs.parse_hms(self.dur_var.get())
-        except ValueError as exc:
-            messagebox.showerror("Run range", f"Start / Duration: {exc}")
-            return
+        start_s = self.start_in.seconds()
+        dur_s = self.dur_in.seconds()
         start_idx = int(round(start_s * RATE))
         end_idx = min(npz.n, start_idx + int(round(dur_s * RATE)))
         if start_idx >= npz.n or end_idx - start_idx < 10 * RATE:
@@ -802,7 +1030,8 @@ class RunApp:
                         "match_tolerance_s": a.tolerance, "warmup_s": a.warmup,
                         "refill_threshold_s": a.refill_threshold, "poll_s": a.poll,
                         "snippet_pre_s": a.snippet_pre, "snippet_post_s": a.snippet_post,
-                        "max_snippets": a.max_snippets, "min_pulse_us": a.min_pulse_us},
+                        "max_snippets": a.max_snippets, "min_pulse_us": a.min_pulse_us,
+                        "autosave_s": self._autosave_interval() if self.autosave_var.get() else 0},
             "stm32": {"port": self.stm_port_var.get(), "baud": a.baud},
             "ppk2": {"port": self.ppk_port_var.get(), "vdd_mv": self.ppk_mv},
             "time_base": "time.perf_counter() seconds on this PC; t_run = t_host - t_go",
@@ -844,13 +1073,14 @@ class RunApp:
         if self.phase == "PREROLL" and self.stm is not None:
             self.stm.push_cmd(("run_go", None))
 
-    def _stop_run(self, status: str) -> None:
+    def _stop_run(self, status: str, discard: bool = False) -> None:
         run = self.run
         if run is None or self.phase not in ACTIVE_PHASES:
             return
         run.status = status
+        run.discard = discard
         self._set_phase("STOPPING")
-        self._event("app", "stop", status)
+        self._event("app", "stop", f"{status}, files {'discarded' if discard else 'kept'}")
         self._stm_resume = None
         if self.stm is not None and self.stm_connected:
             self.stm.push_cmd(("run_stop", None))
@@ -875,6 +1105,17 @@ class RunApp:
 
     def _finalize(self) -> None:
         run = self.run
+        self._stop_checkpoint()
+        if run.discard:
+            for f in (run.events_file, run.log_file):
+                try:
+                    f.close()
+                except Exception:
+                    pass
+            run.events_writer = None
+            run.log_file = None
+            self._discard_run_dir(run, attempt=0)
+            return
         s = run.session
         s["status"] = run.status
         s["t_stop"] = time.perf_counter()
@@ -895,6 +1136,30 @@ class RunApp:
                 self.bgq.put(("analysis_error", (run, traceback.format_exc())))
 
         threading.Thread(target=work, daemon=True, name="analysis").start()
+
+    def _discard_run_dir(self, run: RunState, attempt: int) -> None:
+        """Delete a discarded run. Windows refuses while a file is still open
+        (e.g. the PPK2 process closing late), so retry for a few seconds."""
+        try:
+            shutil.rmtree(run.run_dir)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            if attempt < 10:
+                self.root.after(1000, lambda: self._discard_run_dir(run, attempt + 1))
+                return
+            self._log(f"[WARN] Could not delete {run.run_dir}: {exc}", "warn")
+        else:
+            self._log(f"[APP] Run discarded, deleted {run.run_dir.name}", "warn")
+        if self.run is run:
+            self.run = None
+        if self.last_run_dir == run.run_dir:
+            self.last_run_dir = None
+        self.status_var.set(f"Runs folder: {self.runs_dir}")
+        keep_awake(False)
+        self._set_phase("IDLE")
+        if self._quit_pending:
+            self._quit()
 
     def _on_analysis(self, run: RunState, summary: Optional[dict], error: str = "") -> None:
         if error:
@@ -947,8 +1212,13 @@ class RunApp:
                                 fg=C_BG if ready else C_DIM, activebackground=C_GREEN,
                                 disabledforeground=C_DIM)
         locked = "disabled" if (active or busy) else "normal"
-        for w in (self.npz_btn, self.start_entry, self.dur_entry, self.mv_entry):
-            w.config(state=locked)
+        # Only on a change: re-configuring a box every 0.5 s would disturb typing.
+        if locked != self._lock_state:
+            self._lock_state = locked
+            for w in (self.npz_btn, self.mv_entry, self.stm_port_cb, self.ppk_port_cb):
+                w.config(state=locked)
+            self.start_in.set_state(locked)
+            self.dur_in.set_state(locked)
         self.ready_var.set("   ".join(f"{'✓' if ok else '✗'} {name}"
                                       for name, ok in self._ready_items()))
 
@@ -960,6 +1230,7 @@ class RunApp:
             now = time.perf_counter()
             if now - self._last_ui >= 0.5:
                 self._last_ui = now
+                self._autosave_tick(now)
                 self._refresh_stats(now)
                 self._update_controls()
                 self.plot.redraw()
@@ -1141,12 +1412,108 @@ class RunApp:
         if d["rec"] is not None and self.run is not None:
             self.rec_stats = d["rec"]
             self.overview.add_seconds(d["rec"]["seconds"])
+        self.logic_window.append(d.get("logic"))
         if self.ppk_connected:
             if self.ppk_link == "reconnecting":
                 self.ppk_info_var.set("link lost, reconnecting…")
             else:
                 self.ppk_info_var.set(f"{d['rate'] / 1000:.1f} kS/s  ·  DUT {'ON' if d['dut'] else 'OFF'}"
-                                      f"  ·  D7 pulses {d['rises']}")
+                                      f"  ·  D7 pulses {d['rises']}"
+                                      f"  ·  D0-D7 {logic_states(self.logic_window)}")
+
+    # ── Auto-save snapshots ────────────────────────────────────────────────
+
+    def _autosave_interval(self) -> int:
+        return max(AUTOSAVE_MIN_S, self.autosave_in.peek_seconds())
+
+    def _autosave_tick(self, now: float) -> None:
+        self._poll_checkpoint()
+        run = self.run
+        if (not self.autosave_var.get() or run is None or run.t_go is None
+                or self.phase not in ("RUNNING", "TAIL") or self._ckpt_proc is not None):
+            return
+        t_run = now - run.t_go
+        interval = self._autosave_interval()
+        due = run.last_ckpt + interval
+        if t_run >= due:
+            # Stay on the schedule (1h, 2h, ...) unless it fell a whole interval
+            # behind, e.g. auto-save switched on in the middle of a run.
+            self._start_checkpoint(run, due if t_run - due < interval else t_run)
+
+    def _start_checkpoint(self, run: RunState, at: float) -> None:
+        """Analyse the run so far in a separate process: the analysis re-reads
+        hours of CSV, which must not hold the GIL the UART thread needs."""
+        sec = int(round(at))
+        label = f"{sec // 3600:02d}h{sec % 3600 // 60:02d}m{sec % 60:02d}s"
+        run.last_ckpt = at
+        t_run = time.perf_counter() - run.t_go
+        run.session.setdefault("checkpoints", []).append(
+            {"label": label, "t_run_s": round(t_run, 1),
+             "wall": datetime.now().isoformat(timespec="seconds")})
+        self._write_session()
+        cmd = [sys.executable, str(APP_DIR / "analyze_run.py"), str(run.run_dir),
+               "--checkpoint", label]
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        try:
+            self._ckpt_proc = subprocess.Popen(cmd, cwd=str(APP_DIR), stdout=subprocess.DEVNULL,
+                                               stderr=subprocess.PIPE, creationflags=flags)
+        except OSError as exc:
+            self._event("app", "checkpoint_failed", f"{label}: {exc}")
+            return
+        self._ckpt_run = run
+        self._ckpt_label = label
+        self._event("app", "checkpoint", f"{label}: saving the data so far")
+
+    def _poll_checkpoint(self) -> None:
+        proc = self._ckpt_proc
+        if proc is None or proc.poll() is None:
+            return
+        err = proc.stderr.read().decode(errors="replace").strip() if proc.stderr else ""
+        self._ckpt_proc = None
+        run, label = self._ckpt_run, self._ckpt_label
+        if proc.returncode != 0:
+            self._event("app", "checkpoint_failed",
+                        f"{label}: exit {proc.returncode} {err.splitlines()[-1] if err else ''}")
+            return
+        run.ckpt_count += 1
+        run.last_ckpt_label = label
+        detail = f"{label} saved"
+        try:
+            s = json.loads((run.run_dir / "summary.json").read_text(encoding="utf-8"))
+            v = s["d7"]["verdicts"]
+            avg = s.get("current", {}).get("avg_uA")
+            detail += (f": FP {v.get('FP', 0)}, TP {v.get('TP', 0)}"
+                       + (f", average {fmt_current(avg)}" if avg is not None else ""))
+        except (OSError, ValueError, KeyError):
+            pass
+        self._event("app", "checkpoint_saved", detail)
+
+    def _refresh_autosave_stat(self, now: float) -> None:
+        if not self.autosave_var.get():
+            self._set_stat("autosave", "off", C_DIM)
+            return
+        if self._ckpt_proc is not None:
+            self._set_stat("autosave", f"saving {self._ckpt_label}…", C_YELLOW)
+            return
+        run = self.run
+        if run is not None and run.t_go is not None and self.phase in ("RUNNING", "TAIL"):
+            left = run.last_ckpt + self._autosave_interval() - (now - run.t_go)
+            self._set_stat("autosave", f"next in {rs.fmt_hms(max(left, 0.0))}  "
+                                       f"({run.ckpt_count} saved)", C_CYAN)
+        else:
+            self._set_stat("autosave", f"every {rs.fmt_hms(self._autosave_interval())}", C_SUB)
+
+    def _stop_checkpoint(self) -> None:
+        """A snapshot still running when the run ends is superseded by the
+        final analysis (or by deleting the folder), so stop it."""
+        proc = self._ckpt_proc
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        self._ckpt_proc = None
 
     def _on_pulse(self, d: dict) -> None:
         run = self.run
@@ -1226,6 +1593,7 @@ class RunApp:
         else:
             for key in ("elapsed", "scenario", "progress", "eta", "activity"):
                 self._set_stat(key, "--", C_DIM)
+        self._refresh_autosave_stat(now)
 
         if st is not None:
             self._set_stat("stm", f"{st.state_name}, ring {st.ring_samples}",
@@ -1236,8 +1604,16 @@ class RunApp:
         if running and sp is not None:
             drift = sp.played - (sp.t - run.t_go) * RATE
             self._set_stat("played", f"{sp.played:,}")
-            self._set_stat("drift", f"{drift:+.0f} samples",
-                           C_TEXT if abs(drift) < 50 else (C_YELLOW if abs(drift) < 500 else C_RED))
+            # A steady clock offset (the STM32 here runs about -900 ppm) is
+            # harmless: the mapping uses the played count. Only a rate far off
+            # 50 Hz is worth a colour; stalls and jumps are logged as events.
+            elapsed = sp.t - run.t_go
+            if elapsed > 30:
+                ppm = (sp.played / (elapsed * RATE) - 1) * 1e6
+                self._set_stat("drift", f"{drift:+.0f} smp ({ppm:+.0f} ppm)",
+                               C_TEXT if abs(ppm) < 2000 else C_YELLOW)
+            else:
+                self._set_stat("drift", f"{drift:+.0f} samples")
             self._set_stat("rtt", f"{sp.rtt_ms:.1f} ms  ({len(self.clock):,} points)")
         else:
             for key in ("played", "drift", "rtt"):
@@ -1249,8 +1625,14 @@ class RunApp:
                 self._set_stat("live", fmt_current(float(np.mean(self.recent_blocks))), C_CYAN)
             rate = live["rate"]
             self._set_stat("rate", f"{rate / 1000:.1f} kS/s", C_GREEN if rate >= 99_000 else C_RED)
-            self._set_stat("loss", f"{live['losses']} events (counter {live['counter']})",
-                           C_TEXT if live["losses"] == 0 else C_YELLOW)
+            rec_live = live.get("rec")
+            if rec_live is not None and self.phase in ACTIVE_PHASES:
+                n_run = rec_live.get("losses", 0)
+                self._set_stat("loss", f"{n_run} in run ({live['losses']} since connect)",
+                               C_TEXT if n_run == 0 else C_YELLOW)
+            else:
+                self._set_stat("loss", f"{live['losses']} since connect (counter {live['counter']})",
+                               C_TEXT if live["losses"] == 0 else C_YELLOW)
         else:
             for key in ("live", "rate", "loss"):
                 self._set_stat(key, "--", C_DIM)
@@ -1290,17 +1672,24 @@ class RunApp:
         os.startfile(str(target))
 
     def _on_close(self) -> None:
-        if self.phase in ACTIVE_PHASES or self.phase in ("STOPPING", "ANALYZING"):
-            if not messagebox.askyesno("Quit", "A run is in progress. Stop it, save the data "
-                                               "and quit when the analysis is done?"):
+        if self.phase in ACTIVE_PHASES:
+            choice = self._ask_stop_choice(
+                "Quit", "A run is in progress. Stop it and quit?\n\n"
+                "Save: keep the files, analyse them, then quit.\n"
+                f"Discard: delete this run's folder ({self.run.run_dir.name}), then quit.")
+            if choice == "cancel" or (choice == "discard" and not self._confirm_discard()):
                 return
             self._quit_pending = True
-            if self.phase in ACTIVE_PHASES:
-                self._stop_run("stopped")
+            self._stop_run("stopped", discard=choice == "discard")
+            return
+        if self.phase in ("STOPPING", "ANALYZING"):
+            if messagebox.askyesno("Quit", "The run is still being saved. Quit when it is done?"):
+                self._quit_pending = True
             return
         self._quit()
 
     def _quit(self) -> None:
+        self._stop_checkpoint()
         if self.stm is not None:
             self._stm_user_disconnect = True
             self.stm.request_stop()
@@ -1323,9 +1712,9 @@ def _style(root: tk.Tk) -> None:
     style.configure("Vimu.TCombobox", fieldbackground=C_FIELD, background=C_PANEL_2,
                     foreground=C_TEXT, selectbackground=C_PANEL_3, selectforeground=C_TEXT,
                     bordercolor=C_BORDER, arrowcolor=C_SUB, lightcolor=C_BORDER,
-                    darkcolor=C_BORDER, padding=(6, 3))
-    style.map("Vimu.TCombobox", fieldbackground=[("readonly", C_FIELD)],
-              foreground=[("readonly", C_TEXT)])
+                    darkcolor=C_BORDER, padding=(6, 3), insertcolor=C_TEXT)
+    style.map("Vimu.TCombobox", fieldbackground=[("readonly", C_FIELD), ("disabled", C_PANEL_2)],
+              foreground=[("readonly", C_TEXT), ("disabled", C_DIM)])
     style.configure("Run.Treeview", background=C_FIELD, fieldbackground=C_FIELD,
                     foreground=C_TEXT, rowheight=21, borderwidth=0, font=FONT_MONO_SM)
     style.configure("Run.Treeview.Heading", background=C_PANEL_2, foreground=C_SUB,
@@ -1354,7 +1743,13 @@ def main() -> None:
     ap.add_argument("--max-snippets", type=int, default=1000, help="snippet files per run")
     ap.add_argument("--min-pulse-us", type=float, default=200, help="shorter D7 pulses are glitches")
     ap.add_argument("--runs-dir", default=str(APP_DIR / "runs"))
+    ap.add_argument("--autosave", default="",
+                    help="turn auto-save on with this interval, e.g. 1:00:00 (h:m:s)")
     args = ap.parse_args()
+    try:
+        args.autosave_s = int(rs.parse_hms(args.autosave)) if args.autosave else 0
+    except ValueError:
+        ap.error(f"--autosave: '{args.autosave}' is not h:m:s")
 
     root = tk.Tk()
     _style(root)
