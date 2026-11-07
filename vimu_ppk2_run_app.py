@@ -1,0 +1,1366 @@
+"""VIMU x PPK2 HIL run app.
+
+One START RUN button streams an NPZ recording to the STM32 VIMU and records
+the PPK2 on the same host clock, so every D7 pulse (model FALL verdict on the
+ESP32) can be mapped back to the NPZ sample that was playing.
+
+    py vimu_ppk2_run_app.py
+    py vimu_ppk2_run_app.py --stm32-port COM27 --ppk2-port COM17 --npz <file.npz>
+
+Run sequence (see README.md):
+  ARM      STM32 STOP + CLEAR, ring prefilled with 10 s of NPZ data
+  REC      PPK2 starts writing the run files
+  PRE-ROLL baseline current before any data plays (default 1 s)
+  GO       STM32 START; the run clock starts here (t_run = 0)
+  RUN      auto refill; every UPDATE poll logs the played sample count
+  STOP     at the end of the NPZ range (+ tail) or by the button
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import os
+import queue
+import threading
+import time
+import tkinter as tk
+import traceback
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+from typing import Optional
+
+import numpy as np
+
+import analyze_run
+import ppk2_capture as pc
+import run_sync as rs
+from run_sync import vimu
+
+APP_DIR = Path(__file__).resolve().parent
+RATE = rs.RATE_HZ
+
+C_APP, C_BG, C_HEADER = vimu.C_APP, vimu.C_BG, vimu.C_HEADER
+C_PANEL, C_PANEL_2, C_PANEL_3 = vimu.C_PANEL, vimu.C_PANEL_2, vimu.C_PANEL_3
+C_FIELD, C_BORDER, C_BORDER_2 = vimu.C_FIELD, vimu.C_BORDER, vimu.C_BORDER_2
+C_TEXT, C_SUB, C_DIM, C_FAINT = vimu.C_TEXT, vimu.C_SUB, vimu.C_DIM, vimu.C_FAINT
+C_GREEN, C_YELLOW, C_ORANGE, C_RED = vimu.C_GREEN, vimu.C_YELLOW, vimu.C_ORANGE, vimu.C_RED
+C_BLUE, C_PURPLE, C_CYAN = vimu.C_BLUE, vimu.C_PURPLE, vimu.C_CYAN
+FONT_UI, FONT_UI_SM, FONT_UI_XS = vimu.FONT_UI, vimu.FONT_UI_SM, vimu.FONT_UI_XS
+FONT_UI_BOLD, FONT_TITLE = vimu.FONT_UI_BOLD, vimu.FONT_TITLE
+FONT_MONO, FONT_MONO_SM = vimu.FONT_MONO, vimu.FONT_MONO_SM
+blend = vimu._blend
+
+ACTIVE_PHASES = ("ARMING", "REC_WAIT", "PREROLL", "RUNNING", "TAIL")
+VERDICT_COLORS = {"FP": C_RED, "TP": C_GREEN, "DUP": C_CYAN, "WARMUP": C_DIM,
+                  "PREROLL": C_DIM, "GLITCH": C_YELLOW, "IDLE": C_FAINT}
+
+
+def keep_awake(on: bool) -> None:
+    """Stop Windows from sleeping on idle while a run is in progress.
+    Lid close, a manual sleep and Windows Update restarts are not covered."""
+    try:
+        import ctypes
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if on else 0))
+    except Exception:
+        pass
+
+
+def fmt_current(ua: Optional[float]) -> str:
+    if ua is None or not math.isfinite(ua):
+        return "--"
+    a = abs(ua)
+    if a >= 1000:
+        return f"{ua / 1000:.3f} mA"
+    if a >= 1:
+        return f"{ua:.2f} µA"
+    return f"{ua * 1000:.0f} nA"
+
+
+def _decade_label(d: int) -> str:
+    v = 10.0 ** d  # uA
+    if v >= 1000:
+        return f"{v / 1000:g} mA"
+    if v >= 1:
+        return f"{v:g} µA"
+    return f"{v * 1000:g} nA"
+
+
+def _log_axis(lo_v: float, hi_v: float):
+    lo_v = max(lo_v, 0.1)
+    hi_v = max(hi_v, lo_v * 10)
+    lo = math.floor(math.log10(lo_v))
+    hi = math.ceil(math.log10(hi_v))
+    if hi - lo < 2:
+        lo = hi - 2
+    return lo, hi
+
+
+# ── Plots ──────────────────────────────────────────────────────────────────
+
+class CurrentPlot(tk.Canvas):
+    """Live current, log scale, min-max envelope per pixel, D7 markers."""
+
+    KEEP_S = 600.0
+
+    def __init__(self, parent: tk.Widget) -> None:
+        super().__init__(parent, bg=C_FIELD, highlightthickness=0, height=250)
+        self.window_s = 60.0
+        self._t: deque = deque()
+        self._mean: deque = deque()
+        self._max: deque = deque()
+        self._markers: deque = deque()
+
+    def add(self, t: np.ndarray, mean: np.ndarray, mx: np.ndarray) -> None:
+        if t.size == 0:
+            return
+        self._t.append(t)
+        self._mean.append(mean)
+        self._max.append(mx)
+        cutoff = t[-1] - self.KEEP_S
+        while self._t and self._t[0][-1] < cutoff:
+            self._t.popleft()
+            self._mean.popleft()
+            self._max.popleft()
+        while self._markers and self._markers[0][0] < cutoff:
+            self._markers.popleft()
+
+    def add_marker(self, t: float, color: str) -> None:
+        self._markers.append((t, color))
+
+    def clear_markers(self) -> None:
+        self._markers.clear()
+
+    def redraw(self) -> None:
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 80 or h < 60:
+            return
+        L, R, T, B = 64, 12, 10, 22
+        pw, ph = w - L - R, h - T - B
+        if not self._t:
+            self.create_text(w / 2, h / 2, text="Waiting for PPK2 data", fill=C_DIM, font=FONT_UI)
+            return
+        t = np.concatenate(self._t)
+        mean = np.concatenate(self._mean)
+        mx = np.concatenate(self._max)
+        t_right = float(t[-1])
+        t_left = t_right - self.window_s
+        sel = t >= t_left
+        t, mean, mx = t[sel], mean[sel], mx[sel]
+        if t.size == 0:
+            return
+        col = np.clip(((t - t_left) / self.window_s * (pw - 1)).astype(int), 0, pw - 1)
+        starts = np.flatnonzero(np.r_[True, col[1:] != col[:-1]])
+        counts = np.diff(np.r_[starts, col.size])
+        cols = col[starts]
+        mean_c = np.add.reduceat(mean.astype(np.float64), starts) / counts
+        max_c = np.maximum.reduceat(mx, starts)
+        lo, hi = _log_axis(float(np.min(mean_c)), float(np.max(max_c)))
+
+        def ys(v):
+            v = np.maximum(np.asarray(v, dtype=np.float64), 10.0 ** lo)
+            return T + ph * (1 - (np.log10(v) - lo) / (hi - lo))
+
+        for d in range(lo, hi + 1):
+            yy = float(ys(10.0 ** d))
+            self.create_line(L, yy, L + pw, yy, fill=C_BORDER, dash=(2, 4))
+            self.create_text(L - 6, yy, text=_decade_label(d), anchor="e", fill=C_DIM, font=FONT_MONO_SM)
+        for k in range(5):
+            xx = L + pw * k / 4
+            self.create_line(xx, T, xx, T + ph, fill=C_FAINT, dash=(1, 6))
+            label = "now" if k == 4 else f"-{self.window_s * (1 - k / 4):g}s"
+            self.create_text(xx, T + ph + 11, text=label, fill=C_DIM, font=FONT_MONO_SM)
+
+        x = L + cols.astype(np.float64)
+        y_max, y_mean = ys(max_c), ys(mean_c)
+        if x.size >= 2:
+            poly = np.concatenate((np.column_stack((x, y_max)).ravel(),
+                                   np.column_stack((x[::-1], y_mean[::-1])).ravel()))
+            self.create_polygon(*poly.tolist(), fill=blend(C_CYAN, C_FIELD, 0.78), outline="")
+            self.create_line(*np.column_stack((x, y_mean)).ravel().tolist(), fill=C_CYAN, width=1)
+        for tm, color in self._markers:
+            if t_left <= tm <= t_right:
+                xx = L + (tm - t_left) / self.window_s * (pw - 1)
+                self.create_line(xx, T, xx, T + ph, fill=color, dash=(3, 3))
+                self.create_text(xx + 3, T + 6, text="D7", anchor="w", fill=color, font=FONT_MONO_SM)
+        self.create_rectangle(L, T, L + pw, T + ph, outline=C_BORDER)
+
+
+class OverviewPlot(tk.Canvas):
+    """Whole-run view: 1 s average current and D7 ticks."""
+
+    def __init__(self, parent: tk.Widget) -> None:
+        super().__init__(parent, bg=C_FIELD, highlightthickness=0, height=96)
+        self.total_s = 0.0
+        self._sec: list = []
+        self._marks: list = []
+
+    def reset(self, total_s: float) -> None:
+        self.total_s = total_s
+        self._sec = []
+        self._marks = []
+
+    def add_seconds(self, rows) -> None:
+        for sec, mean in rows:
+            while len(self._sec) < sec:
+                self._sec.append(float("nan"))
+            if sec == len(self._sec):
+                self._sec.append(float(mean))
+            else:
+                self._sec[sec] = float(mean)
+
+    def add_mark(self, sec: float, color: str) -> None:
+        self._marks.append((sec, color))
+
+    def redraw(self) -> None:
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 80 or h < 40:
+            return
+        L, R, T, B = 64, 12, 8, 18
+        pw, ph = w - L - R, h - T - B
+        n = len(self._sec)
+        span = max(self.total_s, n, 1.0)
+        self.create_rectangle(L, T, L + pw, T + ph, outline=C_BORDER)
+        hours = span / 3600
+        step = 1 if hours <= 6 else (2 if hours <= 12 else 4)
+        hr = 0
+        while hr * 3600 <= span and hours >= 1:
+            xx = L + pw * hr * 3600 / span
+            self.create_text(xx, T + ph + 9, text=f"{hr}h", fill=C_DIM, font=FONT_MONO_SM)
+            hr += step
+        if n == 0:
+            self.create_text(w / 2, h / 2, text="Run overview (1 s averages) appears during a run",
+                             fill=C_DIM, font=FONT_UI_SM)
+            return
+        vals = np.array(self._sec)
+        ok = np.isfinite(vals)
+        if not ok.any():
+            return
+        col = (np.arange(n) / span * (pw - 1)).astype(int)
+        sums = np.bincount(col[ok], weights=vals[ok], minlength=pw)
+        cnts = np.bincount(col[ok], minlength=pw)
+        has = cnts > 0
+        means = sums[has] / cnts[has]
+        xs = np.flatnonzero(has)
+        lo, hi = _log_axis(float(means.min()), float(means.max()))
+        ys = T + ph * (1 - (np.log10(np.maximum(means, 10.0 ** lo)) - lo) / (hi - lo))
+        for d in (lo, hi):
+            self.create_text(L - 6, T + ph * (1 - (d - lo) / (hi - lo)), text=_decade_label(d),
+                             anchor="e", fill=C_DIM, font=FONT_MONO_SM)
+        if xs.size >= 2:
+            self.create_line(*np.column_stack((L + xs, ys)).ravel().tolist(), fill=C_CYAN)
+        for sec, color in self._marks:
+            xx = L + pw * sec / span
+            self.create_line(xx, T + ph - 10, xx, T + ph, fill=color, width=2)
+        xx = L + pw * n / span
+        self.create_line(xx, T, xx, T + ph, fill=C_SUB, dash=(2, 2))
+
+
+# ── Run state ──────────────────────────────────────────────────────────────
+
+@dataclass
+class RunState:
+    run_dir: Path
+    start_idx: int
+    end_idx: int
+    session: dict
+    events_file: object = None
+    events_writer: object = None
+    log_file: object = None
+    t_go: Optional[float] = None
+    rec_requested: bool = False
+    rec_started: bool = False
+    stm_stopped: bool = False
+    ppk_stopped: bool = False
+    status: str = ""
+    detected: set = field(default_factory=set)
+    counts: dict = field(default_factory=dict)
+    loss_logged_at: float = 0.0
+
+    @property
+    def length(self) -> int:
+        return self.end_idx - self.start_idx
+
+
+# ── App ────────────────────────────────────────────────────────────────────
+
+class RunApp:
+    def __init__(self, root: tk.Tk, args: argparse.Namespace) -> None:
+        self.root = root
+        self.args = args
+        self.runs_dir = Path(args.runs_dir)
+        self.sq: queue.Queue = queue.Queue()
+        self.lq: queue.Queue = queue.Queue()
+        self.bgq: queue.Queue = queue.Queue()
+
+        self.stm: Optional[rs.RunMonitorThread] = None
+        self.stm_connected = False
+        self.stm_status: Optional[vimu.StatusPayload] = None
+        self._stm_user_disconnect = False
+        self._stm_resume: Optional[dict] = None
+
+        self.ppk = pc.Ppk2Client({
+            "snippet_pre_s": args.snippet_pre, "snippet_post_s": args.snippet_post,
+            "max_snippets": args.max_snippets,
+            "min_pulse_samples": max(1, int(args.min_pulse_us / 10)),
+        })
+        self.ppk_connected = False
+        self.ppk_link = "ok"
+        self.ppk_mv = args.voltage
+        self.dut_on = False
+        self.dut_on_at: Optional[float] = None
+        self.ppk_live: dict = {}
+        self.recent_blocks: deque = deque(maxlen=100)   # 10 ms means -> 1 s average
+        self.rec_stats: Optional[dict] = None
+        self._idle_pulse_logged_at = 0.0
+
+        self.npz: Optional[rs.NpzRunData] = None
+        self.npz_loading = False
+        self.phase = "IDLE"
+        self.run: Optional[RunState] = None
+        self.last_run_dir: Optional[Path] = None
+        self.clock = rs.PlayClock()
+        self.last_sync: Optional[rs.SyncPoint] = None
+        self._quit_pending = False
+        self._last_ui = 0.0
+        self._last_overview = 0.0
+        self._last_pulse_text = "--"
+
+        self._build_ui()
+        self._refresh_ports()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        if args.npz:
+            self._load_npz(args.npz)
+        self._tick()
+
+    # ── UI construction ────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        self.root.title("VIMU × PPK2 HIL Run")
+        self.root.configure(bg=C_APP)
+        self.root.geometry("1440x920")
+        self.root.minsize(1200, 760)
+
+        header = tk.Frame(self.root, bg=C_HEADER)
+        header.pack(fill="x")
+        tk.Label(header, text="VIMU × PPK2  ·  HIL Run", bg=C_HEADER, fg=C_TEXT,
+                 font=FONT_TITLE).pack(side="left", padx=16, pady=10)
+        self.phase_var = tk.StringVar(value="IDLE")
+        self.phase_lbl = tk.Label(header, textvariable=self.phase_var, bg=C_HEADER,
+                                  fg=C_DIM, font=("Segoe UI Semibold", 13))
+        self.phase_lbl.pack(side="right", padx=16)
+
+        body = tk.Frame(self.root, bg=C_APP)
+        body.pack(fill="both", expand=True, padx=10, pady=(6, 0))
+
+        self._build_connections(body)
+        self._build_runbar(body)
+
+        middle = tk.Frame(body, bg=C_APP)
+        middle.pack(fill="both", expand=True, pady=(6, 0))
+        middle.columnconfigure(0, weight=1)
+        middle.rowconfigure(0, weight=1)
+        self._build_plots(middle)
+        self._build_stats(middle)
+
+        bottom = tk.Frame(body, bg=C_APP, height=230)
+        bottom.pack(fill="both", pady=(6, 0))
+        bottom.pack_propagate(False)
+        self._build_table(bottom)
+        self._build_log(bottom)
+
+        status = tk.Frame(self.root, bg=C_HEADER)
+        status.pack(fill="x", side="bottom")
+        self.status_var = tk.StringVar(value=f"Runs folder: {self.runs_dir}")
+        tk.Label(status, textvariable=self.status_var, bg=C_HEADER, fg=C_DIM,
+                 font=FONT_UI_XS, anchor="w").pack(side="left", padx=10, pady=3)
+
+    def _card(self, parent: tk.Widget, title: str) -> tk.Frame:
+        outer = tk.Frame(parent, bg=C_PANEL, highlightthickness=1, highlightbackground=C_BORDER)
+        tk.Label(outer, text=title, bg=C_PANEL, fg=C_SUB, font=FONT_UI_XS,
+                 anchor="w").pack(fill="x", padx=10, pady=(6, 2))
+        inner = tk.Frame(outer, bg=C_PANEL)
+        inner.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        return outer, inner
+
+    def _btn(self, parent: tk.Widget, text: str, cmd, color: str, **kw) -> tk.Button:
+        return tk.Button(parent, text=text, command=cmd,
+                         bg=blend(color, C_PANEL, 0.78), fg=color,
+                         activebackground=blend(color, C_PANEL, 0.6), activeforeground=C_TEXT,
+                         disabledforeground=C_FAINT, relief="flat", bd=0, padx=12, pady=4,
+                         font=FONT_UI_BOLD, cursor="hand2", highlightthickness=1,
+                         highlightbackground=blend(color, C_PANEL, 0.5), **kw)
+
+    def _entry(self, parent: tk.Widget, var: tk.StringVar, width: int) -> tk.Entry:
+        return tk.Entry(parent, textvariable=var, width=width, bg=C_FIELD, fg=C_TEXT,
+                        insertbackground=C_TEXT, relief="flat", font=FONT_MONO,
+                        highlightthickness=1, highlightbackground=C_BORDER,
+                        disabledbackground=C_PANEL_2, disabledforeground=C_DIM)
+
+    def _label(self, parent, text="", fg=C_SUB, font=FONT_UI_SM, **kw) -> tk.Label:
+        return tk.Label(parent, text=text, bg=C_PANEL, fg=fg, font=font, **kw)
+
+    def _build_connections(self, parent: tk.Widget) -> None:
+        row = tk.Frame(parent, bg=C_APP)
+        row.pack(fill="x")
+        for i in range(3):
+            row.columnconfigure(i, weight=1, uniform="conn")
+
+        # STM32
+        card, inner = self._card(row, "STM32 VIMU  (USART1)")
+        card.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        self.stm_port_var = tk.StringVar(value=self.args.stm32_port)
+        self.stm_port_cb = ttk.Combobox(inner, textvariable=self.stm_port_var, width=10,
+                                        style="Vimu.TCombobox")
+        self.stm_port_cb.grid(row=0, column=0, padx=(0, 6))
+        self._btn(inner, "↻", self._refresh_ports, C_SUB).grid(row=0, column=1, padx=(0, 6))
+        self.stm_btn = self._btn(inner, "Connect", self._stm_toggle, C_BLUE, width=10)
+        self.stm_btn.grid(row=0, column=2)
+        self.stm_info_var = tk.StringVar(value="disconnected")
+        self._label(inner, textvariable=self.stm_info_var, fg=C_DIM, font=FONT_MONO_SM,
+                    anchor="w").grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+        # PPK2
+        card, inner = self._card(row, "PPK2  (source meter, D7 = model FALL)")
+        card.grid(row=0, column=1, sticky="nsew", padx=5)
+        self.ppk_port_var = tk.StringVar(value=self.args.ppk2_port or "")
+        self.ppk_port_cb = ttk.Combobox(inner, textvariable=self.ppk_port_var, width=10,
+                                        style="Vimu.TCombobox")
+        self.ppk_port_cb.grid(row=0, column=0, padx=(0, 6))
+        self.mv_var = tk.StringVar(value=str(self.args.voltage))
+        self.mv_entry = self._entry(inner, self.mv_var, 6)
+        self.mv_entry.grid(row=0, column=1)
+        self._label(inner, "mV").grid(row=0, column=2, padx=(2, 8))
+        self.ppk_btn = self._btn(inner, "Connect", self._ppk_toggle, C_BLUE, width=10)
+        self.ppk_btn.grid(row=0, column=3, padx=(0, 6))
+        self.dut_btn = self._btn(inner, "DUT OFF", self._dut_toggle, C_DIM, width=9)
+        self.dut_btn.grid(row=0, column=4)
+        self.ppk_info_var = tk.StringVar(value="disconnected")
+        self._label(inner, textvariable=self.ppk_info_var, fg=C_DIM, font=FONT_MONO_SM,
+                    anchor="w").grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
+
+        # NPZ
+        card, inner = self._card(row, "NPZ recording")
+        card.grid(row=0, column=2, sticky="nsew", padx=(5, 0))
+        self.npz_btn = self._btn(inner, "Load NPZ…", self._pick_npz, C_PURPLE)
+        self.npz_btn.grid(row=0, column=0, padx=(0, 8))
+        self._label(inner, "Start").grid(row=0, column=1)
+        self.start_var = tk.StringVar(value="00:00:00")
+        self.start_entry = self._entry(inner, self.start_var, 9)
+        self.start_entry.grid(row=0, column=2, padx=(4, 8))
+        self._label(inner, "Duration").grid(row=0, column=3)
+        self.dur_var = tk.StringVar(value="24:00:00")
+        self.dur_entry = self._entry(inner, self.dur_var, 9)
+        self.dur_entry.grid(row=0, column=4, padx=(4, 0))
+        self.npz_info_var = tk.StringVar(value="no file loaded")
+        self._label(inner, textvariable=self.npz_info_var, fg=C_DIM, font=FONT_MONO_SM,
+                    anchor="w").grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
+
+    def _build_runbar(self, parent: tk.Widget) -> None:
+        bar = tk.Frame(parent, bg=C_PANEL, highlightthickness=1, highlightbackground=C_BORDER)
+        bar.pack(fill="x", pady=(6, 0))
+        self.run_btn = tk.Button(bar, text="▶  START RUN", command=self._start_or_stop,
+                                 font=("Segoe UI Semibold", 13), relief="flat", bd=0,
+                                 padx=26, pady=8, cursor="hand2", width=16)
+        self.run_btn.pack(side="left", padx=10, pady=8)
+        self.ready_var = tk.StringVar()
+        tk.Label(bar, textvariable=self.ready_var, bg=C_PANEL, fg=C_SUB,
+                 font=FONT_MONO, anchor="w").pack(side="left", padx=10)
+        self._btn(bar, "Open run folder", self._open_folder, C_SUB).pack(side="right", padx=10)
+        self.window_var = tk.StringVar(value="60 s")
+        cb = ttk.Combobox(bar, textvariable=self.window_var, width=7, state="readonly",
+                          values=["10 s", "60 s", "600 s"], style="Vimu.TCombobox")
+        cb.pack(side="right")
+        cb.bind("<<ComboboxSelected>>", self._on_window_change)
+        tk.Label(bar, text="Plot window", bg=C_PANEL, fg=C_DIM, font=FONT_UI_XS).pack(side="right", padx=6)
+
+    def _build_plots(self, parent: tk.Widget) -> None:
+        frame = tk.Frame(parent, bg=C_PANEL, highlightthickness=1, highlightbackground=C_BORDER)
+        frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        tk.Label(frame, text="Current (log scale)  ·  dashed lines = D7 pulses", bg=C_PANEL,
+                 fg=C_SUB, font=FONT_UI_XS, anchor="w").pack(fill="x", padx=10, pady=(6, 0))
+        self.plot = CurrentPlot(frame)
+        self.plot.pack(fill="both", expand=True, padx=8, pady=(2, 4))
+        self.overview = OverviewPlot(frame)
+        self.overview.pack(fill="x", padx=8, pady=(0, 8))
+
+    def _build_stats(self, parent: tk.Widget) -> None:
+        frame = tk.Frame(parent, bg=C_PANEL, highlightthickness=1, highlightbackground=C_BORDER,
+                         width=400)
+        frame.grid(row=0, column=1, sticky="nsew")
+        frame.grid_propagate(False)
+        self.stat_vars: dict = {}
+        self.stat_lbls: dict = {}
+        sections = [
+            ("RUN", [("elapsed", "Elapsed"), ("scenario", "NPZ time"), ("progress", "Progress"),
+                     ("eta", "Remaining"), ("activity", "Activity")]),
+            ("SYNC", [("stm", "STM32"), ("played", "Played"), ("drift", "Drift vs 50 Hz"),
+                      ("rtt", "UPDATE RTT")]),
+            ("PPK2", [("live", "Live (1 s)"), ("avg", "Run average"), ("charge", "Charge"),
+                      ("rate", "Stream"), ("loss", "Sample loss")]),
+            ("D7", [("pulses", "Pulses"), ("fp", "False alarms"), ("tp", "Falls hit"),
+                    ("last", "Last pulse")]),
+        ]
+        r = 0
+        for title, items in sections:
+            tk.Label(frame, text=title, bg=C_PANEL, fg=C_BLUE, font=FONT_UI_XS,
+                     anchor="w").grid(row=r, column=0, columnspan=2, sticky="w",
+                                      padx=12, pady=(8 if r else 6, 2))
+            r += 1
+            for key, label in items:
+                tk.Label(frame, text=label, bg=C_PANEL, fg=C_DIM, font=FONT_UI_SM,
+                         anchor="w").grid(row=r, column=0, sticky="w", padx=(16, 8))
+                var = tk.StringVar(value="--")
+                lbl = tk.Label(frame, textvariable=var, bg=C_PANEL, fg=C_TEXT, font=FONT_MONO,
+                               anchor="w")
+                lbl.grid(row=r, column=1, sticky="w")
+                self.stat_vars[key] = var
+                self.stat_lbls[key] = lbl
+                r += 1
+        frame.columnconfigure(1, weight=1)
+
+    def _build_table(self, parent: tk.Widget) -> None:
+        frame = tk.Frame(parent, bg=C_PANEL, highlightthickness=1, highlightbackground=C_BORDER)
+        frame.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        tk.Label(frame, text="D7 pulses (live mapping; final values in d7_events.csv)",
+                 bg=C_PANEL, fg=C_SUB, font=FONT_UI_XS, anchor="w").pack(fill="x", padx=10, pady=(6, 2))
+        cols = [("no", "#", 50), ("run", "Run time", 90), ("scen", "NPZ time", 90),
+                ("idx", "NPZ idx", 80), ("act", "Activity", 220), ("verdict", "Verdict", 70),
+                ("w", "Width", 60)]
+        self.table = ttk.Treeview(frame, columns=[c[0] for c in cols], show="headings",
+                                  style="Run.Treeview", height=7)
+        for key, title, width in cols:
+            self.table.heading(key, text=title)
+            self.table.column(key, width=width, anchor="w", stretch=key == "act")
+        for verdict, color in VERDICT_COLORS.items():
+            self.table.tag_configure(verdict, foreground=color)
+        sb = ttk.Scrollbar(frame, orient="vertical", command=self.table.yview)
+        self.table.configure(yscrollcommand=sb.set)
+        self.table.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=(0, 8))
+        sb.pack(side="left", fill="y", pady=(0, 8), padx=(0, 6))
+
+    def _build_log(self, parent: tk.Widget) -> None:
+        frame = tk.Frame(parent, bg=C_PANEL, highlightthickness=1, highlightbackground=C_BORDER)
+        frame.pack(side="left", fill="both", expand=True)
+        tk.Label(frame, text="Log", bg=C_PANEL, fg=C_SUB, font=FONT_UI_XS,
+                 anchor="w").pack(fill="x", padx=10, pady=(6, 2))
+        self.log = tk.Text(frame, bg=C_FIELD, fg=C_SUB, font=FONT_MONO_SM, relief="flat",
+                           wrap="none", height=10, state="disabled", insertbackground=C_TEXT)
+        self.log.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        for tag, color in (("warn", C_YELLOW), ("error", C_RED), ("run", C_CYAN),
+                           ("ppk", C_PURPLE), ("time", C_DIM), ("ok", C_GREEN)):
+            self.log.tag_configure(tag, foreground=color)
+
+    # ── Logging ────────────────────────────────────────────────────────────
+
+    def _log(self, msg: str, tag: str = "", screen: bool = True) -> None:
+        if not screen:
+            if self.run is not None and self.run.log_file is not None:
+                try:
+                    self.run.log_file.write(f"{datetime.now().isoformat(timespec='milliseconds')}  {msg}\n")
+                except Exception:
+                    pass
+            return
+        if not tag:
+            up = msg[:12].upper()
+            if "[ERROR" in up:
+                tag = "error"
+            elif "[WARN" in up:
+                tag = "warn"
+            elif "[RUN" in up or "[APP" in up or "[STM32" in up:
+                tag = "run"
+            elif "[PPK2" in up:
+                tag = "ppk"
+        stamp = time.strftime("%H:%M:%S")
+        self.log.config(state="normal")
+        self.log.insert("end", stamp + "  ", "time")
+        self.log.insert("end", msg + "\n", tag)
+        lines = int(self.log.index("end-1c").split(".")[0])
+        if lines > 1000:
+            self.log.delete("1.0", f"{lines - 1000}.0")
+        self.log.see("end")
+        self.log.config(state="disabled")
+        if self.run is not None and self.run.log_file is not None:
+            try:
+                self.run.log_file.write(f"{datetime.now().isoformat(timespec='milliseconds')}  {msg}\n")
+                self.run.log_file.flush()
+            except Exception:
+                pass
+
+    def _event(self, source: str, kind: str, detail: str = "", t: Optional[float] = None,
+               log: bool = True) -> None:
+        t = time.perf_counter() if t is None else t
+        if log:
+            tag = "warn" if kind in ("warn", "ring_underrun", "playback_stall", "played_jump",
+                                     "stm32_not_running", "uart_lost", "sample_loss",
+                                     "link_lost") else ("error" if kind == "error" else "")
+            self._log(f"[{source.upper()}] {kind}: {detail}" if detail else f"[{source.upper()}] {kind}", tag)
+        run = self.run
+        if run is not None and run.events_writer is not None:
+            t_run = f"{t - run.t_go:.3f}" if run.t_go is not None else ""
+            run.events_writer.writerow([f"{t:.6f}", t_run, datetime.now().isoformat(timespec="seconds"),
+                                        source, kind, detail])
+            run.events_file.flush()
+
+    # ── Ports and connections ──────────────────────────────────────────────
+
+    def _refresh_ports(self) -> None:
+        try:
+            from serial.tools import list_ports
+            ports = sorted(p.device for p in list_ports.comports())
+        except Exception:
+            ports = []
+        ppk_ports = pc.list_ppk2_ports()
+        self.stm_port_cb["values"] = [p for p in ports if p not in ppk_ports] + ppk_ports
+        self.ppk_port_cb["values"] = ppk_ports + [p for p in ports if p not in ppk_ports]
+        if not self.ppk_port_var.get() and ppk_ports:
+            self.ppk_port_var.set(ppk_ports[-1])
+
+    def _stm_toggle(self) -> None:
+        if self.stm is not None:
+            if self.phase in ACTIVE_PHASES:
+                messagebox.showwarning("Run in progress", "Stop the run before disconnecting.")
+                return
+            self._stm_user_disconnect = True
+            self.stm.request_stop()
+            self.stm_btn.config(text="Connect", state="disabled")
+            return
+        self._stm_start_thread()
+
+    def _stm_start_thread(self) -> None:
+        port = self.stm_port_var.get().strip()
+        if not port:
+            return
+        self.stm = rs.RunMonitorThread(port, self.args.baud, self.args.poll, self.sq, self.lq,
+                                       refill_threshold_s=self.args.refill_threshold)
+        if self.npz is not None:
+            self.stm.set_data_source(self.npz.samples, self.npz.fall_ids)
+        self.stm.start()
+        self.stm_btn.config(text="Disconnect")
+        self.stm_info_var.set(f"connecting to {port}…")
+
+    def _on_stm_lost(self) -> None:
+        thread = self.stm
+        self.stm = None
+        self.stm_connected = False
+        self.stm_btn.config(text="Connect", state="normal")
+        if self._stm_user_disconnect:
+            self._stm_user_disconnect = False
+            self.stm_info_var.set("disconnected")
+            return
+        if self.run is not None and self.phase in ("RUNNING", "TAIL"):
+            if self._stm_resume is None and thread is not None:
+                self._stm_resume = thread.export_run_state()
+                self._event("app", "uart_lost", "STM32 UART dropped, retrying every 3 s")
+            self.stm_info_var.set("link lost, reconnecting…")
+            self.root.after(3000, self._stm_reconnect_for_run)
+        elif self.run is not None and self.phase in ("ARMING", "REC_WAIT", "PREROLL"):
+            self._event("app", "error", "STM32 UART dropped before GO")
+            self._stop_run("error")
+        else:
+            self.stm_info_var.set("disconnected")
+
+    def _stm_reconnect_for_run(self) -> None:
+        if self._stm_resume is None or self.stm is not None or self.phase not in ("RUNNING", "TAIL"):
+            return
+        self._stm_start_thread()
+
+    def _ppk_toggle(self) -> None:
+        if self.ppk_connected or self.ppk_link == "reconnecting":
+            if self.phase in ACTIVE_PHASES:
+                messagebox.showwarning("Run in progress", "Stop the run before disconnecting.")
+                return
+            self.ppk.send("disconnect")
+            return
+        try:
+            mv = int(self.mv_var.get())
+        except ValueError:
+            messagebox.showerror("PPK2", "Voltage must be a whole number of mV")
+            return
+        port = self.ppk_port_var.get().strip()
+        if not port:
+            messagebox.showerror("PPK2", "Select the PPK2 port (COM17 here)")
+            return
+        self.ppk_info_var.set(f"connecting to {port}…")
+        self.ppk_mv = mv
+        self.ppk.send("connect", port, mv)
+
+    def _dut_toggle(self) -> None:
+        if not self.ppk_connected:
+            return
+        if self.dut_on and self.phase in ACTIVE_PHASES:
+            if not messagebox.askyesno("DUT power", "A run is in progress. Turn the ESP32 off anyway?"):
+                return
+        self.ppk.send("dut", not self.dut_on)
+
+    # ── NPZ ────────────────────────────────────────────────────────────────
+
+    def _pick_npz(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Load NPZ recording", initialdir=str(rs.TOOL_DIR),
+            filetypes=[("NumPy archive", "*.npz"), ("All files", "*.*")])
+        if path:
+            self._load_npz(path)
+
+    def _load_npz(self, path: str) -> None:
+        if self.npz_loading:
+            return
+        self.npz_loading = True
+        self.npz_info_var.set("loading…")
+
+        def work():
+            try:
+                self.bgq.put(("npz", rs.load_npz_run_data(path)))
+            except Exception as exc:
+                self.bgq.put(("npz_error", f"{path}: {exc}"))
+
+        threading.Thread(target=work, daemon=True, name="npz-load").start()
+
+    def _on_npz_loaded(self, data: rs.NpzRunData) -> None:
+        self.npz_loading = False
+        self.npz = data
+        hours = data.n / RATE / 3600
+        name = Path(data.path).name
+        self.npz_info_var.set(f"{name}  ·  {data.n:,} samples  ·  {hours:.2f} h  ·  "
+                              f"{len(data.episodes)} falls")
+        self.start_var.set("00:00:00")
+        self.dur_var.set(rs.fmt_hms(data.n / RATE))
+        if self.stm is not None:
+            self.stm.set_data_source(data.samples, data.fall_ids)
+        self._log(f"[APP] NPZ loaded: {name}, {data.n:,} samples at {RATE} Hz ({hours:.2f} h), "
+                  f"{len(data.episodes)} labelled falls")
+        if not data.episodes:
+            self._log("[APP] This file has no labelled falls: every D7 pulse will count as a "
+                      "false alarm", "warn")
+
+    # ── Run control ────────────────────────────────────────────────────────
+
+    def _ready_items(self):
+        return [("STM32", self.stm_connected), ("PPK2", self.ppk_connected),
+                ("DUT", self.dut_on), ("NPZ", self.npz is not None)]
+
+    def _start_or_stop(self) -> None:
+        if self.phase in ACTIVE_PHASES:
+            if messagebox.askyesno("Stop run", "Stop the run now? Data so far is kept and analysed."):
+                self._stop_run("stopped")
+        elif self.phase in ("IDLE", "DONE"):
+            self._start_run()
+
+    def _start_run(self) -> None:
+        missing = [name for name, ok in self._ready_items() if not ok]
+        if missing:
+            messagebox.showwarning("Not ready", "Missing: " + ", ".join(missing))
+            return
+        npz = self.npz
+        try:
+            start_s = rs.parse_hms(self.start_var.get())
+            dur_s = rs.parse_hms(self.dur_var.get())
+        except ValueError as exc:
+            messagebox.showerror("Run range", f"Start / Duration: {exc}")
+            return
+        start_idx = int(round(start_s * RATE))
+        end_idx = min(npz.n, start_idx + int(round(dur_s * RATE)))
+        if start_idx >= npz.n or end_idx - start_idx < 10 * RATE:
+            messagebox.showerror("Run range", "The run must cover at least 10 s inside the file.")
+            return
+        if self.dut_on_at is not None and time.perf_counter() - self.dut_on_at < self.args.boot_wait:
+            if not messagebox.askyesno(
+                    "ESP32 just powered", "DUT power was switched on less than "
+                    f"{self.args.boot_wait:g} s ago. The ESP32 may still be booting and "
+                    "re-initialising the sensor. Start anyway?"):
+                return
+
+        self.runs_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = self.runs_dir / stamp
+        k = 1
+        while run_dir.exists():
+            run_dir = self.runs_dir / f"{stamp}_{k}"
+            k += 1
+        run_dir.mkdir(parents=True)
+
+        a = self.args
+        session = {
+            "app": "vimu_ppk2_run_app", "format": 1,
+            "created": datetime.now().isoformat(timespec="seconds"),
+            "status": "arming",
+            "npz": {"path": npz.path, "samples": npz.n, "stride": npz.stride,
+                    "falls": len(npz.episodes)},
+            "run": {"start_idx": start_idx, "end_idx": end_idx,
+                    "start": rs.fmt_hms(start_idx / RATE),
+                    "duration_s": (end_idx - start_idx) / RATE, "rate_hz": RATE},
+            "options": {"preroll_s": a.preroll, "tail_s": a.tail,
+                        "match_tolerance_s": a.tolerance, "warmup_s": a.warmup,
+                        "refill_threshold_s": a.refill_threshold, "poll_s": a.poll,
+                        "snippet_pre_s": a.snippet_pre, "snippet_post_s": a.snippet_post,
+                        "max_snippets": a.max_snippets, "min_pulse_us": a.min_pulse_us},
+            "stm32": {"port": self.stm_port_var.get(), "baud": a.baud},
+            "ppk2": {"port": self.ppk_port_var.get(), "vdd_mv": self.ppk_mv},
+            "time_base": "time.perf_counter() seconds on this PC; t_run = t_host - t_go",
+        }
+        run = RunState(run_dir=run_dir, start_idx=start_idx, end_idx=end_idx, session=session)
+        run.counts = {k: 0 for k in ("FP", "TP", "DUP", "WARMUP", "PREROLL", "GLITCH")}
+        run.events_file = open(run_dir / "run_events.csv", "w", newline="", encoding="utf-8")
+        run.events_writer = csv.writer(run.events_file)
+        run.events_writer.writerow(["t_host", "t_run_s", "wall", "source", "kind", "detail"])
+        run.log_file = open(run_dir / "app_log.txt", "w", encoding="utf-8")
+        self.run = run
+        self.last_run_dir = run_dir
+        self._write_session()
+
+        self.clock = rs.PlayClock()
+        self.last_sync = None
+        self.rec_stats = None
+        self.plot.clear_markers()
+        self.overview.reset(total_s=(end_idx - start_idx) / RATE)
+        for item in self.table.get_children():
+            self.table.delete(item)
+        self._last_pulse_text = "--"
+        self.status_var.set(f"Run folder: {run_dir}")
+
+        keep_awake(True)
+        self._set_phase("ARMING")
+        self._event("app", "arm", f"NPZ {start_idx}..{end_idx} "
+                                  f"({rs.fmt_hms(start_idx / RATE)} + {rs.fmt_hms((end_idx - start_idx) / RATE)})")
+        self.stm.push_cmd(("run_arm", {"start": start_idx, "end": end_idx,
+                                       "sync_csv": str(run_dir / "sync_log.csv")}))
+        self.root.after(60000, lambda r=run: self._arm_watchdog(r))
+
+    def _arm_watchdog(self, run: RunState) -> None:
+        if self.run is run and self.phase in ("ARMING", "REC_WAIT", "PREROLL"):
+            self._event("app", "error", f"run did not reach GO within 60 s (stuck in {self.phase})")
+            self._stop_run("error")
+
+    def _go(self) -> None:
+        if self.phase == "PREROLL" and self.stm is not None:
+            self.stm.push_cmd(("run_go", None))
+
+    def _stop_run(self, status: str) -> None:
+        run = self.run
+        if run is None or self.phase not in ACTIVE_PHASES:
+            return
+        run.status = status
+        self._set_phase("STOPPING")
+        self._event("app", "stop", status)
+        self._stm_resume = None
+        if self.stm is not None and self.stm_connected:
+            self.stm.push_cmd(("run_stop", None))
+        else:
+            run.stm_stopped = True
+        if run.rec_requested:
+            self.ppk.send("rec_stop")
+        else:
+            run.ppk_stopped = True
+        self.root.after(15000, lambda r=run: self._force_finalize(r))
+        self._maybe_finalize()
+
+    def _maybe_finalize(self) -> None:
+        run = self.run
+        if run is not None and self.phase == "STOPPING" and run.stm_stopped and run.ppk_stopped:
+            self._finalize()
+
+    def _force_finalize(self, run: RunState) -> None:
+        if self.run is run and self.phase == "STOPPING":
+            self._log("[WARN] Stop not confirmed by every device after 15 s, finishing anyway", "warn")
+            self._finalize()
+
+    def _finalize(self) -> None:
+        run = self.run
+        s = run.session
+        s["status"] = run.status
+        s["t_stop"] = time.perf_counter()
+        s["wall_stop"] = datetime.now().isoformat(timespec="milliseconds")
+        s["live_counts"] = run.counts
+        self._write_session()
+        self._event("app", "finished", f"status={run.status}, analysing…")
+        run.events_file.close()
+        run.events_writer = None
+        self._set_phase("ANALYZING")
+        npz = self.npz
+
+        def work():
+            try:
+                summary = analyze_run.analyze(run.run_dir, npz=npz, log=lambda _s: None)
+                self.bgq.put(("analysis", (run, summary)))
+            except Exception:
+                self.bgq.put(("analysis_error", (run, traceback.format_exc())))
+
+        threading.Thread(target=work, daemon=True, name="analysis").start()
+
+    def _on_analysis(self, run: RunState, summary: Optional[dict], error: str = "") -> None:
+        if error:
+            self._log(f"[ERROR] Analysis failed:\n{error}", "error")
+        else:
+            for line in analyze_run.format_summary(summary).splitlines():
+                self._log(line, "ok" if line and not line.startswith(" ") else "")
+            self._log(f"[APP] Results in {run.run_dir}", "ok")
+        try:
+            run.log_file.close()
+        except Exception:
+            pass
+        run.log_file = None
+        keep_awake(False)
+        self._set_phase("DONE")
+        if self._quit_pending:
+            self._quit()
+
+    def _write_session(self) -> None:
+        run = self.run
+        if run is None:
+            return
+        tmp = run.run_dir / "session.json.tmp"
+        tmp.write_text(json.dumps(run.session, indent=2), encoding="utf-8")
+        os.replace(tmp, run.run_dir / "session.json")
+
+    def _set_phase(self, phase: str) -> None:
+        self.phase = phase
+        colors = {"IDLE": C_DIM, "ARMING": C_YELLOW, "REC_WAIT": C_YELLOW, "PREROLL": C_YELLOW,
+                  "RUNNING": C_GREEN, "TAIL": C_GREEN, "STOPPING": C_ORANGE,
+                  "ANALYZING": C_PURPLE, "DONE": C_BLUE}
+        names = {"REC_WAIT": "ARMING", "PREROLL": "PRE-ROLL", "TAIL": "RUNNING (tail)"}
+        self.phase_var.set(names.get(phase, phase))
+        self.phase_lbl.config(fg=colors.get(phase, C_DIM))
+        self._update_controls()
+
+    def _update_controls(self) -> None:
+        active = self.phase in ACTIVE_PHASES
+        busy = self.phase in ("STOPPING", "ANALYZING")
+        if active:
+            self.run_btn.config(text="■  STOP RUN", state="normal", bg=blend(C_RED, C_PANEL, 0.7),
+                                fg=C_TEXT, activebackground=C_RED)
+        elif busy:
+            self.run_btn.config(text="…  " + self.phase.title(), state="disabled",
+                                bg=C_PANEL_2, disabledforeground=C_DIM)
+        else:
+            ready = all(ok for _, ok in self._ready_items())
+            self.run_btn.config(text="▶  START RUN", state="normal" if ready else "disabled",
+                                bg=blend(C_GREEN, C_PANEL, 0.35 if ready else 0.85),
+                                fg=C_BG if ready else C_DIM, activebackground=C_GREEN,
+                                disabledforeground=C_DIM)
+        locked = "disabled" if (active or busy) else "normal"
+        for w in (self.npz_btn, self.start_entry, self.dur_entry, self.mv_entry):
+            w.config(state=locked)
+        self.ready_var.set("   ".join(f"{'✓' if ok else '✗'} {name}"
+                                      for name, ok in self._ready_items()))
+
+    # ── Event pump ─────────────────────────────────────────────────────────
+
+    def _tick(self) -> None:
+        try:
+            self._drain()
+            now = time.perf_counter()
+            if now - self._last_ui >= 0.5:
+                self._last_ui = now
+                self._refresh_stats(now)
+                self._update_controls()
+                self.plot.redraw()
+            if now - self._last_overview >= 2.0:
+                self._last_overview = now
+                self.overview.redraw()
+        except Exception:
+            self._log("[ERROR] GUI tick: " + traceback.format_exc().strip().splitlines()[-1], "error")
+        finally:
+            self.root.after(100, self._tick)
+
+    def _drain(self) -> None:
+        for _ in range(500):
+            try:
+                msg = self.lq.get_nowait()
+            except queue.Empty:
+                break
+            # Routine refill lines come every few seconds for 24 h: file only.
+            routine = msg.startswith("[AUTO] ring=") or msg.startswith("[DATA] Done")
+            self._log(msg, screen=not routine)
+        for _ in range(500):
+            try:
+                self._on_stm_item(self.sq.get_nowait())
+            except queue.Empty:
+                break
+        for kind, data in self.ppk.poll():
+            self._on_ppk_event(kind, data)
+        while True:
+            try:
+                kind, data = self.bgq.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "npz":
+                self._on_npz_loaded(data)
+            elif kind == "npz_error":
+                self.npz_loading = False
+                self.npz_info_var.set("load failed")
+                self._log(f"[ERROR] NPZ load failed: {data}", "error")
+            elif kind == "analysis":
+                self._on_analysis(*data)
+            elif kind == "analysis_error":
+                self._on_analysis(data[0], None, data[1])
+
+    def _on_stm_item(self, item) -> None:
+        if isinstance(item, vimu.StatusPayload):
+            self.stm_status = item
+            return
+        if item == "connected":
+            self.stm_connected = True
+            if self._stm_resume is not None and self.stm is not None:
+                self.stm.push_cmd(("run_resume", self._stm_resume))
+                self._stm_resume = None
+            return
+        if item == "error":
+            return
+        if item == "disconnected":
+            self._on_stm_lost()
+            return
+        if not isinstance(item, tuple):
+            return
+        kind, data = item
+        run = self.run
+        if kind == "sync":
+            self.clock.add(data.t, data.played)
+            self.last_sync = data
+        elif kind == "run_event":
+            t, ev_kind, detail = data
+            self._event("stm32", ev_kind, detail, t=t, log=False)
+        elif kind == "run_armed" and run is not None and self.phase == "ARMING":
+            self._event("app", "armed", f"prefill {data['prefill']} samples; {data['status']}")
+            self._set_phase("REC_WAIT")
+            run.rec_requested = True
+            self.ppk.send("rec_start", {"run_dir": str(run.run_dir)})
+        elif kind == "run_go" and run is not None and self.phase == "PREROLL":
+            run.t_go = data["t_go"]
+            self.clock.add(run.t_go, 0)
+            wall = datetime.now() - timedelta(seconds=time.perf_counter() - run.t_go)
+            run.session.update({"status": "running", "t_go": run.t_go,
+                                "wall_go": wall.isoformat(timespec="milliseconds"),
+                                "go_rtt_ms": data["rtt_ms"]})
+            self._write_session()
+            self._set_phase("RUNNING")
+            self._event("app", "go", f"STM32 START acknowledged in {data['rtt_ms']:.1f} ms, "
+                                     "t_run = 0")
+        elif kind == "run_complete" and self.phase == "RUNNING":
+            self._set_phase("TAIL")
+            self._event("app", "complete", f"all samples played, stopping in {self.args.tail:g} s")
+            self.root.after(int(self.args.tail * 1000), lambda: self._stop_run("completed"))
+        elif kind == "run_stopped" and run is not None:
+            run.stm_stopped = True
+            self._maybe_finalize()
+        elif kind == "run_error":
+            self._event("app", "error", str(data))
+            if self.phase in ("ARMING", "REC_WAIT", "PREROLL"):
+                self._stop_run("error")
+
+    def _on_ppk_event(self, kind: str, data) -> None:
+        run = self.run
+        active = run is not None and self.phase in ACTIVE_PHASES + ("STOPPING",)
+        if kind == "live":
+            self._on_live(data)
+        elif kind == "pulse":
+            self._on_pulse(data)
+        elif kind == "log":
+            self._log(f"[PPK2] {data}")
+        elif kind == "warn":
+            if active:
+                self._event("ppk2", "warn", str(data))
+            else:
+                self._log(f"[WARN] PPK2: {data}", "warn")
+        elif kind in ("error", "fatal"):
+            if active:
+                self._event("ppk2", "error", str(data))
+            else:
+                self._log(f"[ERROR] PPK2: {data}", "error")
+            if not self.ppk_connected:
+                self.ppk_info_var.set("error, see log")
+            if self.phase == "REC_WAIT" and str(data).startswith("rec_start"):
+                self._stop_run("error")
+        elif kind == "connected":
+            self.ppk_connected = True
+            self.ppk_link = "ok"
+            self.ppk_btn.config(text="Disconnect")
+            self._log(f"[PPK2] connected on {data['port']}, source {data['vdd_mv']} mV, "
+                      "measuring (DUT power OFF)")
+        elif kind == "disconnected":
+            self.ppk_connected = False
+            self.dut_on = False
+            self.dut_on_at = None
+            self.ppk_btn.config(text="Connect")
+            self.ppk_info_var.set("disconnected")
+        elif kind == "dut":
+            self.dut_on = data["on"]
+            self.dut_on_at = data["t"] if data["on"] else None
+            self.dut_btn.config(text="DUT ON" if self.dut_on else "DUT OFF",
+                                fg=C_GREEN if self.dut_on else C_DIM)
+            if active:
+                self._event("ppk2", "dut_power", "ON" if self.dut_on else "OFF", t=data["t"])
+            else:
+                self._log(f"[PPK2] DUT power {'ON' if self.dut_on else 'OFF'}")
+        elif kind == "link":
+            self.ppk_link = data["state"]
+            if active:
+                self._event("ppk2", "link_lost" if data["state"] == "reconnecting" else "link_ok")
+        elif kind == "loss":
+            if active and run is not None:
+                now = time.perf_counter()
+                detail = f"{data['lost']} samples ({data['source']}) at n={data['n']}"
+                # every gap is in ppk_loss.csv; keep the event log readable
+                self._event("ppk2", "sample_loss", detail, t=data["t"],
+                            log=now - run.loss_logged_at > 10)
+                if now - run.loss_logged_at > 10:
+                    run.loss_logged_at = now
+        elif kind == "rec_started" and run is not None:
+            run.rec_started = True
+            run.session["rec"] = data
+            self._write_session()
+            if self.phase == "REC_WAIT":
+                self._set_phase("PREROLL")
+                self._event("app", "recording", f"PPK2 recording from sample {data['rec_start_n']}, "
+                                                f"GO in {self.args.preroll:g} s")
+                self.root.after(int(self.args.preroll * 1000), self._go)
+        elif kind == "rec_stopped" and run is not None and self.phase == "STOPPING":
+            run.session["ppk_meta"] = data
+            run.ppk_stopped = True
+            self._maybe_finalize()
+        elif kind == "exited":
+            self.ppk_connected = False
+            self._log("[WARN] PPK2 process exited", "warn")
+
+    def _on_live(self, d: dict) -> None:
+        self.ppk_live = d
+        if d["g_n0"] is not None and d["g_mean"].size and d["offset"] is not None:
+            k = d["g_mean"].size
+            n_mid = d["g_n0"] + (np.arange(k) + 0.5) * d["g_block"]
+            t = n_mid * rs.PPK2_PERIOD_S + d["offset"]
+            self.plot.add(t, d["g_mean"], d["g_max"])
+            self.recent_blocks.extend(d["g_mean"].tolist())
+        if d["rec"] is not None and self.run is not None:
+            self.rec_stats = d["rec"]
+            self.overview.add_seconds(d["rec"]["seconds"])
+        if self.ppk_connected:
+            if self.ppk_link == "reconnecting":
+                self.ppk_info_var.set("link lost, reconnecting…")
+            else:
+                self.ppk_info_var.set(f"{d['rate'] / 1000:.1f} kS/s  ·  DUT {'ON' if d['dut'] else 'OFF'}"
+                                      f"  ·  D7 pulses {d['rises']}")
+
+    def _on_pulse(self, d: dict) -> None:
+        run = self.run
+        t = d["t_est"]
+        if run is None or not d["recording"] or self.phase not in ACTIVE_PHASES + ("STOPPING",):
+            if t is not None:
+                self.plot.add_marker(t, C_FAINT)
+            now = time.perf_counter()
+            if now - self._idle_pulse_logged_at > 10:
+                self._idle_pulse_logged_at = now
+                self._log(f"[PPK2] D7 pulse outside a run (width {d['width'] / 100:.2f} ms)")
+            return
+
+        idx = None
+        lab = {"category": "", "phase": "", "task": ""}
+        if d["glitch"]:
+            verdict = "GLITCH"
+        elif run.t_go is None or t is None:
+            verdict = "PREROLL"
+        else:
+            played = self.clock.played_at(t)
+            if played is None or played < 0:
+                verdict = "PREROLL"
+            else:
+                idx = run.start_idx + min(int(math.floor(played)), run.length - 1)
+                lab = self.npz.labels_at(idx)
+                verdict, _fid = rs.classify_pulse(idx, run.start_idx, self.npz.episodes,
+                                                  int(self.args.tolerance * RATE),
+                                                  int(self.args.warmup * RATE), run.detected)
+        run.counts[verdict] = run.counts.get(verdict, 0) + 1
+        color = VERDICT_COLORS.get(verdict, C_SUB)
+        if t is not None:
+            self.plot.add_marker(t, color)
+        if d["n_rel"] is not None:
+            self.overview.add_mark(d["n_rel"] * rs.PPK2_PERIOD_S, color)
+
+        t_run = rs.fmt_hms(t - run.t_go, 1) if (t is not None and run.t_go is not None) else "--"
+        activity = " · ".join(x for x in (lab["category"], lab["phase"], lab["task"]) if x)
+        self.table.insert("", 0, values=(
+            d["rise_no"], t_run, rs.fmt_hms(idx / RATE, 1) if idx is not None else "--",
+            idx if idx is not None else "--", activity or "--", verdict,
+            f"{d['width'] / 100:.2f} ms"), tags=(verdict,))
+        children = self.table.get_children()
+        if len(children) > 500:
+            self.table.delete(*children[500:])
+        self._last_pulse_text = f"#{d['rise_no']} {verdict} @ {t_run}"
+
+    # ── Stats panel ────────────────────────────────────────────────────────
+
+    def _set_stat(self, key: str, text: str, color: str = C_TEXT) -> None:
+        self.stat_vars[key].set(text)
+        self.stat_lbls[key].config(fg=color)
+
+    def _refresh_stats(self, now: float) -> None:
+        run = self.run
+        st = self.stm_status
+        if self.stm_connected and st is not None:
+            ring = f"{st.ring_samples}/{vimu.RING_CAPACITY}" if st.ring_samples is not None else st.level_name
+            self.stm_info_var.set(f"{st.state_name}  ·  ring {ring}  ·  {', '.join(st.flag_names)}")
+        elif self.stm_connected:
+            self.stm_info_var.set("connected")
+
+        running = run is not None and run.t_go is not None
+        played = 0.0
+        if running:
+            t_end = now if self.phase in ACTIVE_PHASES else run.session.get("t_stop", now)
+            played = self.clock.played_at(t_end) or 0.0
+            played = min(max(played, 0.0), run.length)
+            idx = run.start_idx + min(int(played), run.length - 1)
+            self._set_stat("elapsed", rs.fmt_hms(t_end - run.t_go))
+            self._set_stat("scenario", f"{rs.fmt_hms(idx / RATE)} / {rs.fmt_hms(run.end_idx / RATE)}")
+            self._set_stat("progress", f"{played / run.length * 100:.2f} %  ({int(played):,} smp)")
+            self._set_stat("eta", rs.fmt_hms((run.length - played) / RATE))
+            lab = self.npz.labels_at(idx)
+            self._set_stat("activity", " · ".join(x for x in (lab["category"], lab["phase"],
+                                                              lab["task"]) if x) or "--", C_CYAN)
+        else:
+            for key in ("elapsed", "scenario", "progress", "eta", "activity"):
+                self._set_stat(key, "--", C_DIM)
+
+        if st is not None:
+            self._set_stat("stm", f"{st.state_name}, ring {st.ring_samples}",
+                           C_GREEN if st.state == vimu.VIMU_STATE_RUNNING else C_YELLOW)
+        else:
+            self._set_stat("stm", "--", C_DIM)
+        sp = self.last_sync
+        if running and sp is not None:
+            drift = sp.played - (sp.t - run.t_go) * RATE
+            self._set_stat("played", f"{sp.played:,}")
+            self._set_stat("drift", f"{drift:+.0f} samples",
+                           C_TEXT if abs(drift) < 50 else (C_YELLOW if abs(drift) < 500 else C_RED))
+            self._set_stat("rtt", f"{sp.rtt_ms:.1f} ms  ({len(self.clock):,} points)")
+        else:
+            for key in ("played", "drift", "rtt"):
+                self._set_stat(key, "--", C_DIM)
+
+        live = self.ppk_live
+        if self.ppk_connected and live:
+            if self.recent_blocks:
+                self._set_stat("live", fmt_current(float(np.mean(self.recent_blocks))), C_CYAN)
+            rate = live["rate"]
+            self._set_stat("rate", f"{rate / 1000:.1f} kS/s", C_GREEN if rate >= 99_000 else C_RED)
+            self._set_stat("loss", f"{live['losses']} events (counter {live['counter']})",
+                           C_TEXT if live["losses"] == 0 else C_YELLOW)
+        else:
+            for key in ("live", "rate", "loss"):
+                self._set_stat(key, "--", C_DIM)
+        rec = self.rec_stats
+        if run is not None and rec is not None:
+            self._set_stat("avg", fmt_current(rec["avg_uA"]))
+            self._set_stat("charge", f"{rec['charge_uC'] / 3.6e6:.4f} mAh")
+        else:
+            self._set_stat("avg", "--", C_DIM)
+            self._set_stat("charge", "--", C_DIM)
+
+        if run is not None:
+            c = run.counts
+            total = sum(c.values())
+            other = c.get("WARMUP", 0) + c.get("PREROLL", 0) + c.get("GLITCH", 0)
+            hours = played / RATE / 3600
+            fp = c.get("FP", 0)
+            fp_rate = f"  ({fp / hours:.1f}/h)" if hours > 0.05 else ""
+            falls = [ep for ep in self.npz.episodes if run.start_idx <= ep.start_sample < run.end_idx]
+            self._set_stat("pulses", f"{total}  (other {other})")
+            self._set_stat("fp", f"{fp}{fp_rate}", C_RED if fp else C_TEXT)
+            self._set_stat("tp", f"{len(run.detected)} / {len(falls)}", C_GREEN if run.detected else C_TEXT)
+            self._set_stat("last", self._last_pulse_text)
+        else:
+            for key in ("pulses", "fp", "tp", "last"):
+                self._set_stat(key, "--", C_DIM)
+
+    # ── Misc ───────────────────────────────────────────────────────────────
+
+    def _on_window_change(self, _event=None) -> None:
+        self.plot.window_s = float(self.window_var.get().split()[0])
+        self.plot.redraw()
+
+    def _open_folder(self) -> None:
+        target = self.last_run_dir or self.runs_dir
+        target.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(target))
+
+    def _on_close(self) -> None:
+        if self.phase in ACTIVE_PHASES or self.phase in ("STOPPING", "ANALYZING"):
+            if not messagebox.askyesno("Quit", "A run is in progress. Stop it, save the data "
+                                               "and quit when the analysis is done?"):
+                return
+            self._quit_pending = True
+            if self.phase in ACTIVE_PHASES:
+                self._stop_run("stopped")
+            return
+        self._quit()
+
+    def _quit(self) -> None:
+        if self.stm is not None:
+            self._stm_user_disconnect = True
+            self.stm.request_stop()
+        self.ppk.close(timeout=5)
+        self.root.destroy()
+
+
+# ── Entry point ────────────────────────────────────────────────────────────
+
+def _style(root: tk.Tk) -> None:
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+    root.option_add("*TCombobox*Listbox.background", C_FIELD)
+    root.option_add("*TCombobox*Listbox.foreground", C_TEXT)
+    root.option_add("*TCombobox*Listbox.selectBackground", C_PANEL_3)
+    root.option_add("*TCombobox*Listbox.selectForeground", C_TEXT)
+    style.configure("Vimu.TCombobox", fieldbackground=C_FIELD, background=C_PANEL_2,
+                    foreground=C_TEXT, selectbackground=C_PANEL_3, selectforeground=C_TEXT,
+                    bordercolor=C_BORDER, arrowcolor=C_SUB, lightcolor=C_BORDER,
+                    darkcolor=C_BORDER, padding=(6, 3))
+    style.map("Vimu.TCombobox", fieldbackground=[("readonly", C_FIELD)],
+              foreground=[("readonly", C_TEXT)])
+    style.configure("Run.Treeview", background=C_FIELD, fieldbackground=C_FIELD,
+                    foreground=C_TEXT, rowheight=21, borderwidth=0, font=FONT_MONO_SM)
+    style.configure("Run.Treeview.Heading", background=C_PANEL_2, foreground=C_SUB,
+                    font=FONT_UI_XS, relief="flat", borderwidth=0)
+    style.map("Run.Treeview", background=[("selected", C_PANEL_3)])
+    style.configure("Vertical.TScrollbar", background=C_PANEL_2, troughcolor=C_FIELD,
+                    bordercolor=C_BORDER, arrowcolor=C_SUB)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="VIMU x PPK2 HIL run app")
+    ap.add_argument("--stm32-port", default=vimu.DEFAULT_SERIAL_PORT)
+    ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--poll", type=float, default=0.5, help="STM32 UPDATE poll period (s)")
+    ap.add_argument("--ppk2-port", default="", help="PPK2 data port, e.g. COM17")
+    ap.add_argument("--voltage", type=int, default=3300, help="PPK2 source voltage (mV)")
+    ap.add_argument("--npz", default="", help="NPZ file to load at start")
+    ap.add_argument("--preroll", type=float, default=1.0, help="PPK2 baseline before GO (s)")
+    ap.add_argument("--tail", type=float, default=5.0, help="keep recording after the last sample (s)")
+    ap.add_argument("--tolerance", type=float, default=3.0, help="TP window after a fall ends (s)")
+    ap.add_argument("--warmup", type=float, default=4.0, help="seconds after GO that are not scored")
+    ap.add_argument("--boot-wait", type=float, default=5.0, help="warn if DUT was powered more recently (s)")
+    ap.add_argument("--refill-threshold", type=int, default=7, help="refill the ring below this (s)")
+    ap.add_argument("--snippet-pre", type=float, default=1.0, help="full-rate data before a D7 pulse (s)")
+    ap.add_argument("--snippet-post", type=float, default=1.0, help="full-rate data after a D7 pulse (s)")
+    ap.add_argument("--max-snippets", type=int, default=1000, help="snippet files per run")
+    ap.add_argument("--min-pulse-us", type=float, default=200, help="shorter D7 pulses are glitches")
+    ap.add_argument("--runs-dir", default=str(APP_DIR / "runs"))
+    args = ap.parse_args()
+
+    root = tk.Tk()
+    _style(root)
+    RunApp(root, args)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
