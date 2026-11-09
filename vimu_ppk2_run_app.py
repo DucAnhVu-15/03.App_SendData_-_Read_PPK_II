@@ -42,12 +42,20 @@ import numpy as np
 
 import analyze_run
 import ppk2_capture as pc
+import ppk_raw
 import run_sync as rs
 from run_sync import vimu
 
 APP_DIR = Path(__file__).resolve().parent
 RATE = rs.RATE_HZ
 AUTOSAVE_MIN_S = 60  # shortest auto-save interval; each snapshot re-reads the run files
+
+# Every PPK2 sample is saved as ppk_raw/raw_HHhMMmSSs.npz, one file per minute
+# (about 0.2 GB per hour). With RAW_CSV = 1 each file also gets a CSV twin with
+# the same rows, Timestamp(ms),Current(uA),D0-D7, to check the NPZ against
+# (about 11 GB per hour). Set it to 0 once the NPZ is trusted. --raw-csv 0/1
+# overrides it for one start of the app.
+RAW_CSV = 1
 
 C_APP, C_BG, C_HEADER = vimu.C_APP, vimu.C_BG, vimu.C_HEADER
 C_PANEL, C_PANEL_2, C_PANEL_3 = vimu.C_PANEL, vimu.C_PANEL_2, vimu.C_PANEL_3
@@ -158,6 +166,22 @@ def fmt_current(ua: Optional[float]) -> str:
     if a >= 1:
         return f"{ua:.2f} µA"
     return f"{ua * 1000:.0f} nA"
+
+
+def raw_stat(raw: dict) -> tuple:
+    """Text and colour of the 'Raw 100 kS/s' line in the PPK2 stats."""
+    if not raw["npz_on"]:
+        return f"stopped: {raw['error'] or 'disk almost full'}", C_RED
+    text = f"{raw['files']} files, {raw['npz_bytes'] / 1e9:.2f} GB"
+    if raw["csv_on"]:
+        text += f" · CSV {raw['csv_bytes'] / 1e9:.1f} GB"
+    elif raw["csv_bytes"]:
+        text += f" · CSV stopped at {raw['csv_bytes'] / 1e9:.1f} GB"
+    else:
+        text += " · CSV off"
+    if raw["backlog_s"] > 10:
+        return f"{text} · {raw['backlog_s']:.0f} s behind", C_YELLOW
+    return text, C_TEXT
 
 
 def logic_states(window) -> str:
@@ -673,7 +697,7 @@ class RunApp:
             ("SYNC", [("stm", "STM32"), ("played", "Played"), ("drift", "Drift vs 50 Hz"),
                       ("rtt", "UPDATE RTT")]),
             ("PPK2", [("live", "Live (1 s)"), ("avg", "Run average"), ("charge", "Charge"),
-                      ("rate", "Stream"), ("loss", "Sample loss")]),
+                      ("rate", "Stream"), ("loss", "Sample loss"), ("raw", "Raw 100 kS/s")]),
             ("D7", [("pulses", "Pulses"), ("fp", "False alarms"), ("tp", "Falls hit"),
                     ("last", "Last pulse")]),
         ]
@@ -1031,7 +1055,8 @@ class RunApp:
                         "refill_threshold_s": a.refill_threshold, "poll_s": a.poll,
                         "snippet_pre_s": a.snippet_pre, "snippet_post_s": a.snippet_post,
                         "max_snippets": a.max_snippets, "min_pulse_us": a.min_pulse_us,
-                        "autosave_s": self._autosave_interval() if self.autosave_var.get() else 0},
+                        "autosave_s": self._autosave_interval() if self.autosave_var.get() else 0,
+                        "raw_csv": int(a.raw_csv), "raw_file_s": ppk_raw.FILE_S},
             "stm32": {"port": self.stm_port_var.get(), "baud": a.baud},
             "ppk2": {"port": self.ppk_port_var.get(), "vdd_mv": self.ppk_mv},
             "time_base": "time.perf_counter() seconds on this PC; t_run = t_host - t_go",
@@ -1045,6 +1070,7 @@ class RunApp:
         self.run = run
         self.last_run_dir = run_dir
         self._write_session()
+        self._log_raw_estimate(run_dir, (end_idx - start_idx) / RATE / 3600)
 
         self.clock = rs.PlayClock()
         self.last_sync = None
@@ -1063,6 +1089,24 @@ class RunApp:
         self.stm.push_cmd(("run_arm", {"start": start_idx, "end": end_idx,
                                        "sync_csv": str(run_dir / "sync_log.csv")}))
         self.root.after(60000, lambda r=run: self._arm_watchdog(r))
+
+    def _log_raw_estimate(self, run_dir: Path, hours: float) -> None:
+        """Disk needed by the raw files of this run, and whether the CSV fits."""
+        per_hour = 3600 * pc.SAMPLE_RATE_HZ / 1e9
+        npz_gb = hours * per_hour * ppk_raw.NPZ_BYTES_PER_SAMPLE
+        free_gb = shutil.disk_usage(run_dir).free / 1e9
+        if not self.args.raw_csv:
+            self._log(f"[APP] Raw 100 kS/s: NPZ about {npz_gb:.1f} GB in ppk_raw/, CSV off; "
+                      f"{free_gb:.0f} GB free")
+            return
+        csv_h = per_hour * ppk_raw.CSV_BYTES_PER_ROW
+        self._log(f"[APP] Raw 100 kS/s: NPZ about {npz_gb:.1f} GB in ppk_raw/, CSV twin ON, "
+                  f"about {hours * csv_h:.0f} GB ({csv_h:.0f} GB/h); {free_gb:.0f} GB free")
+        room_h = (free_gb - ppk_raw.CSV_MIN_FREE_GB) / csv_h
+        if room_h < hours:
+            self._log(f"[WARN] The raw CSV does not fit: it stops by itself after about "
+                      f"{max(room_h, 0.0):.1f} h, when {ppk_raw.CSV_MIN_FREE_GB:g} GB is left. "
+                      "The NPZ files continue. Set RAW_CSV = 0 for long runs.", "warn")
 
     def _arm_watchdog(self, run: RunState) -> None:
         if self.run is run and self.phase in ("ARMING", "REC_WAIT", "PREROLL"):
@@ -1303,7 +1347,8 @@ class RunApp:
             self._event("app", "armed", f"prefill {data['prefill']} samples; {data['status']}")
             self._set_phase("REC_WAIT")
             run.rec_requested = True
-            self.ppk.send("rec_start", {"run_dir": str(run.run_dir)})
+            self.ppk.send("rec_start", {"run_dir": str(run.run_dir),
+                                        "raw_csv": bool(self.args.raw_csv)})
         elif kind == "run_go" and run is not None and self.phase == "PREROLL":
             run.t_go = data["t_go"]
             self.clock.add(run.t_go, 0)
@@ -1643,6 +1688,11 @@ class RunApp:
         else:
             self._set_stat("avg", "--", C_DIM)
             self._set_stat("charge", "--", C_DIM)
+        raw = rec.get("raw") if run is not None and rec is not None else None
+        if raw is not None:
+            self._set_stat("raw", *raw_stat(raw))
+        else:
+            self._set_stat("raw", "--", C_DIM)
 
         if run is not None:
             c = run.counts
@@ -1742,6 +1792,9 @@ def main() -> None:
     ap.add_argument("--snippet-post", type=float, default=1.0, help="full-rate data after a D7 pulse (s)")
     ap.add_argument("--max-snippets", type=int, default=1000, help="snippet files per run")
     ap.add_argument("--min-pulse-us", type=float, default=200, help="shorter D7 pulses are glitches")
+    ap.add_argument("--raw-csv", type=int, choices=(0, 1), default=RAW_CSV,
+                    help=f"1 = CSV twin of every raw NPZ file, 0 = NPZ only (default {RAW_CSV}, "
+                         "the RAW_CSV line at the top of this file)")
     ap.add_argument("--runs-dir", default=str(APP_DIR / "runs"))
     ap.add_argument("--autosave", default="",
                     help="turn auto-save on with this interval, e.g. 1:00:00 (h:m:s)")

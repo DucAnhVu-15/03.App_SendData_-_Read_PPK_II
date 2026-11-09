@@ -9,6 +9,7 @@ One app that streams an NPZ recording to the STM32 VIMU and records the PPK2 at 
 | `vimu_ppk2_run_app.py` | GUI and the START RUN sequence. This is the file to run. |
 | `run_sync.py` | STM32 run control (`RunMonitorThread`), NPZ labels, and the host-time maps `PlayClock` and `AnchorMap`. |
 | `ppk2_capture.py` | PPK2 capture in its own process: conversion, D7 pulses, anchors and the run files. |
+| `ppk_raw.py` | The raw 100 kS/s files: format, writer, loader, and the `check` and `csv` commands. |
 | `analyze_run.py` | Post-run analysis. The app runs it at the end, and it also runs on its own. |
 
 ## Folder layout
@@ -49,7 +50,7 @@ The firmware and the PPK2 wiring come from the matching repos: ULP_FALL (ESP32-S
 
    While a run is active the app stops idle sleep itself. It cannot prevent a lid close, a manual sleep or an update restart.
 3. **Ports:** close the nRF Connect Power Profiler, which holds the PPK2 port (COM17).
-4. **Disk:** a 24 h run takes about 0.4 GB, plus up to 1 GB of D7 snippets.
+4. **Disk:** a 24 h run takes about 0.4 GB, plus up to 1 GB of D7 snippets and about 5 GB of raw 100 kS/s NPZ files. The raw CSV twin needs about 11 GB per hour, so set `RAW_CSV = 0` before a long run (see [Raw 100 kS/s data](#raw-100-kss-data)).
 
 ## Run
 
@@ -122,9 +123,11 @@ The expected error is about ±20 ms, set by the 50 Hz tick. The ESP32 only wakes
 | `current_1ms_HH.f32` | Mean µA of every 1 ms, float32 LE, one file per hour. Read it with `np.fromfile(path, "<f4")` |
 | `d7_pulses.csv`, `ppk_anchors.csv`, `ppk_loss.csv`, `ppk_meta.json` | Raw PPK2-side data used by the analysis |
 | `snippets/d7_NNNNN.npz` | Full 100 kS/s current and D0–D7 for ±1 s around each D7 pulse (max 1000 per run) |
+| `ppk_raw/raw_HHhMMmSSs.npz` | Every PPK2 sample, Current(uA) and D0-D7, one file per minute. See [Raw 100 kS/s data](#raw-100-kss-data) |
+| `ppk_raw/raw_HHhMMmSSs.csv` | The same rows as CSV text, while `RAW_CSV = 1` |
 | `app_log.txt` | Full log, including every refill |
 
-The run does **not** write a raw 100 kS/s CSV. For 24 h that file would be about 225 GB. The average current and the charge are still summed from every sample, not from the 1 ms means.
+The average current and the charge are summed from every sample, not from the 1 ms means.
 
 Verdicts:
 - `TP`: the first pulse within [fall start, fall end + 3 s].
@@ -135,6 +138,53 @@ Verdicts:
 - `GLITCH`: a pulse shorter than 200 µs.
 
 `P01_S01_SA06_typical_day.npz` has no labelled falls, so on that file every pulse is an FP. The 24 h run measures false alarms per day and the average current.
+
+## Raw 100 kS/s data
+
+Every PPK2 sample of a run is saved in `ppk_raw/`, one file per minute of samples. Each file is named after the Timestamp of its first row: `raw_00h00m00s.npz`, `raw_00h01m00s.npz`, and so on. The files hold the three columns of the nRF Connect CSV export:
+
+| Key | Type | Column |
+|---|---|---|
+| `current_uA` | float32, one per row | Current(uA) |
+| `d0_d7` | uint8, one per row | D0-D7 as one byte, bit i = Di. D7 high is 128, and `(d0_d7 >> 7) & 1` is D7 |
+| `t0_ms`, `dt_ms` | float64 | Timestamp(ms) of row i is `t0_ms + i × dt_ms`, where `dt_ms` is 0.01 |
+| `n_rel_start`, `n_start` | int64 | Row 0 as `n_rel` and as `n` in `d7_pulses.csv` |
+
+Timestamp 0 is the start of the PPK2 recording (REC). With the default pre-roll, that is 1 s before GO. Like the nRF Connect export, the Timestamp counts samples, so samples lost on the USB link (`ppk_loss.csv`) are not in it. The Timestamp of a D7 pulse is its `n_rel × 0.01` from `d7_pulses.csv`.
+
+**Size.** The arrays are bzip2-compressed inside the `.npz`. On real captures that comes to about 0.6 byte per sample: 0.2 GB per hour, or 5 GB per 24 h. Uncompressed, the same data takes 43 GB, and as CSV about 270 GB. Timestamps are not stored per row, because a float64 column would double the size. Current is float32. Above 16 mA, its third decimal can differ by 1 to 3 nA from a float64 export, while one PPK2 step there is tens of µA.
+
+**Read in Python.** `np.load()` reads the files directly. `ppk_raw.py` also builds the Timestamp column:
+
+```python
+import ppk_raw
+ts_ms, cur_uA, d0_d7 = ppk_raw.load(r"runs\20261109_101500\ppk_raw\raw_00h10m00s.npz")
+ts_ms, cur_uA, d0_d7 = ppk_raw.load_run(r"runs\20261109_101500", start_ms=600_000, end_ms=630_000)
+```
+
+`load_run` joins files. It needs about 80 MB of memory per minute of data, so load a window rather than a whole day.
+
+**CSV twin (`RAW_CSV`).** While `RAW_CSV = 1` at the top of `vimu_ppk2_run_app.py`, each NPZ file gets a CSV with the same rows, for example `raw_00h10m00s.csv`. Its format is the one of `1.TestBasic.py`: `Timestamp(ms),Current(uA),D0-D7`, with D0 first, so a D7 pulse reads `00000001`. The CSV takes about 11 GB per hour. When less than 10 GB is free, the CSV stops by itself and the NPZ files continue. Once the NPZ is trusted, set `RAW_CSV = 0`. To change it for one session only, start the app with `--raw-csv 0` or `--raw-csv 1`.
+
+To check every NPZ file against its twin:
+
+```bash
+py ppk_raw.py check runs\20261109_101500
+```
+
+The check compares every row: Timestamp to 0.01 ms, Current to 0.001 µA, and D0-D7 exactly.
+
+**CSV from the NPZ later.** With the twin off, you can still write any time window as CSV, in the same format:
+
+```bash
+py ppk_raw.py csv runs\20261109_101500 --from 0:10:00 --to 0:10:30
+```
+
+The output is `ppk_00h10m00s-00h10m30s.csv` in the run folder. Use `-o` to choose another path. Without `--from` and `--to`, the command writes the whole run. It refuses to start if the file would not fit on the disk. Excel opens only the first 1,048,576 rows, about 10.5 s of data.
+
+**After a crash.** The minute in progress is held in memory, so a crash loses at most that minute. Each file is written under a `.part` name and renamed when complete, so a file with its final name is always whole.
+
+The `Raw 100 kS/s` line in the PPK2 stats shows the number of files, the GB written, and the CSV state.
 
 ## 10-minute sync check first
 
@@ -161,6 +211,7 @@ py analyze_run.py runs\20261107_201500 --tolerance 5 --warmup 4
 | `--snippet-pre` / `--snippet-post` | 1.0 / 1.0 | Full-rate data around each pulse (s) |
 | `--max-snippets` | 1000 | Snippet files per run |
 | `--min-pulse-us` | 200 | Shorter D7 pulses are glitches |
+| `--raw-csv` | `RAW_CSV` (1) | 1 = CSV twin of every raw NPZ file, 0 = NPZ only |
 | `--boot-wait` | 5.0 | Ask before START if DUT power is more recent than this (s) |
 | `--runs-dir` | `runs` | Output folder |
 | `--autosave` | off | Auto-save interval, e.g. `1:00:00` |

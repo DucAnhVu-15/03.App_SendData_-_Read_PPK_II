@@ -14,6 +14,9 @@ Files written while recording, all in the run directory:
   d7_pulses.csv          every D7 pulse: sample index, width, host time
   ppk_loss.csv           sample gaps found by the PPK2 counter or a reconnect
   snippets/d7_NNNNN.npz  full-rate current and D0-D7 around a D7 pulse
+  ppk_raw/raw_HHhMMmSSs.npz  every sample, Current(uA) and D0-D7, one file per
+                         minute, bzip2 inside (format in ppk_raw.py)
+  ppk_raw/raw_HHhMMmSSs.csv  the same rows as CSV text, when raw CSV is on
   ppk_meta.json          totals, written when recording stops
 """
 
@@ -30,6 +33,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+
+from ppk_raw import RawWriter
 
 try:
     import serial
@@ -371,11 +376,14 @@ class Recorder:
     """Writes one run's PPK2 files. Everything is flushed every few seconds,
     so a crash late in a 24 h run still leaves the hours before it."""
 
-    def __init__(self, run_dir: Path, rec_start_n: int) -> None:
+    def __init__(self, run_dir: Path, rec_start_n: int, raw_csv: bool = False,
+                 warn=None) -> None:
         self.dir = Path(run_dir)
         self.snip_dir = self.dir / "snippets"
         self.snip_dir.mkdir(parents=True, exist_ok=True)
         self.rec_start_n = rec_start_n
+        self.raw = RawWriter(self.dir, rec_start_n, csv_on=raw_csv,
+                             warn=warn or (lambda _text: None))
         self._ms = BlockReducer(BLOCK_1MS, rec_start_n)
         self._ms_blocks = 0
         self._ms_file = None
@@ -408,7 +416,8 @@ class Recorder:
         self._files.append(f)
         return w
 
-    def feed(self, n0: int, cur: np.ndarray) -> None:
+    def feed(self, n0: int, cur: np.ndarray, bits: np.ndarray) -> None:
+        self.raw.feed(cur, bits)
         first, means, _ = self._ms.feed(n0, cur)
         if means.size:
             self._write_ms(means)
@@ -472,6 +481,7 @@ class Recorder:
             self._ms_file.flush()
 
     def close(self, n_end: int, extra: dict) -> dict:
+        raw = self.raw.close()
         if self._sec.count:
             self._write_second(self._sec.row())  # partial last second
         if self._ms_file is not None:
@@ -499,6 +509,7 @@ class Recorder:
             "snippets": self.snippets,
             "loss_events": self.losses,
             "lost_samples_counter": self.lost,
+            "raw": raw,
         }
         meta.update(extra)
         with open(self.dir / "ppk_meta.json", "w", encoding="utf-8") as f:
@@ -686,7 +697,9 @@ class CaptureWorker:
         if self.rec is not None:
             self._rec_stop()
         self._process()
-        self.rec = Recorder(Path(params["run_dir"]), self.n_proc)
+        self.rec = Recorder(Path(params["run_dir"]), self.n_proc,
+                            raw_csv=bool(params.get("raw_csv", False)),
+                            warn=lambda text: self._send("warn", text))
         self.pending_snips.clear()
         self._send("rec_started", {"rec_start_n": self.n_proc, "t": time.perf_counter(),
                                    "offset": self.anchors.offset(),
@@ -842,7 +855,7 @@ class CaptureWorker:
             self.live_max.append(maxs.astype(np.float32))
 
         if self.rec is not None:
-            self.rec.feed(n0, cur)
+            self.rec.feed(n0, cur, bits)
 
     def _logic_stats(self, bits: np.ndarray) -> None:
         """Edges and levels on every logic channel, to show in the GUI which
@@ -936,6 +949,7 @@ class CaptureWorker:
                 "seconds": r.take_seconds(),
                 "snippets": r.snippets,
                 "losses": r.losses,
+                "raw": r.raw.stats(),
             }
         self._send("live", msg)
 
