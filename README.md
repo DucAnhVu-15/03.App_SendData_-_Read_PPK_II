@@ -70,7 +70,24 @@ py vimu_ppk2_run_app.py --stm32-port COM19 --ppk2-port COM17 --npz "..\Tool_send
 
 Closing the window during a run asks the same question, then quits.
 
-On a small screen the app opens maximised. The stats panel on the right scrolls with the mouse wheel, and its scrollbar only shows when the panel is cut. The bar above the D7 table and log is a divider: drag it down to give the plots and stats more room.
+The middle of the window has two columns:
+- **Saved files** lists every file this run has saved, newest first, with the time it was saved:
+  - one `ppk_raw/raw_….npz` per minute, with the PPK2 time it holds and the size of the NPZ and of its CSV twin;
+  - the auto-save checkpoints;
+  - the final analysis.
+
+  The title shows the run folder and the free disk space.
+- **VIMU ring buffer** shows the STM32 ring as of the last `UPDATE` (every 0.5 s):
+  - a fill bar, with the refill threshold as a dashed line;
+  - the state and flags;
+  - the samples sent and played;
+  - the number of refills and how often they come;
+  - the lowest ring level of the run, not counting the end of the data;
+  - the number of underruns.
+
+  Below it, each prefill or refill gets one row: the time, the ring level before, the samples sent, and the NPZ cursor. A refill that sent fewer samples than it asked for is shown in yellow.
+
+On a small screen the app opens maximised. The stats panel on the right scrolls with the mouse wheel, and its scrollbar only shows when the panel is cut. The bar above the D7 table and log is a divider: drag it down to give the file list, the ring panel and the stats more room.
 
 Do not switch DUT power on as part of the run. On boot the ESP32 writes `CTRL_REG1` standby and then active, which stops and restarts the STM32 in the middle of the run. If DUT power was switched on less than 5 s before START RUN, the app asks before starting.
 

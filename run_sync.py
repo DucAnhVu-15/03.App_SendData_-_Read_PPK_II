@@ -290,7 +290,7 @@ class RunMonitorThread(vimu.MonitorThread):
       ("run_stop", None)                          STOP, close the sync log
       ("run_resume", state)                       continue after a UART reconnect
     Signals go to the status queue as tuples: run_armed, run_go, sync,
-    run_event, run_complete, run_stopped, run_error.
+    run_event, ring_fill, run_complete, run_stopped, run_error.
     """
 
     def __init__(self, port: str, baudrate: int, poll_interval: float,
@@ -309,6 +309,7 @@ class RunMonitorThread(vimu.MonitorThread):
         self._underrun = False
         self._stalled = False
         self._complete = False
+        self._refill_status = None   # the UPDATE status that triggered the refill in progress
 
     def run(self) -> None:
         try:
@@ -462,12 +463,24 @@ class RunMonitorThread(vimu.MonitorThread):
             total = min(total, self._run_cfg["end"] - self._sample_cursor)
             if total <= 0:
                 return
+        before = self._sample_cursor
         super()._send_new_data_frames(io, total)
+        # One ring_fill per prefill or refill, for the ring panel of the GUI.
+        trigger = self._refill_status
+        self._sq.put(("ring_fill", {
+            "wall": time.time(), "kind": "prefill" if trigger is None else "refill",
+            "ring_before": None if trigger is None else trigger.ring_samples,
+            "requested": total, "sent": self._sample_cursor - before,
+            "cursor": self._sample_cursor}))
 
     def _maybe_refill(self, io, status) -> None:
         if self._run_cfg is not None and self._sample_cursor >= self._run_cfg["end"]:
             return
-        super()._maybe_refill(io, status)
+        self._refill_status = status
+        try:
+            super()._maybe_refill(io, status)
+        finally:
+            self._refill_status = None
 
     def _recover_link(self, io) -> None:
         if self._run_active:

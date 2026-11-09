@@ -377,13 +377,13 @@ class Recorder:
     so a crash late in a 24 h run still leaves the hours before it."""
 
     def __init__(self, run_dir: Path, rec_start_n: int, raw_csv: bool = False,
-                 warn=None) -> None:
+                 warn=None, on_file=None) -> None:
         self.dir = Path(run_dir)
         self.snip_dir = self.dir / "snippets"
         self.snip_dir.mkdir(parents=True, exist_ok=True)
         self.rec_start_n = rec_start_n
         self.raw = RawWriter(self.dir, rec_start_n, csv_on=raw_csv,
-                             warn=warn or (lambda _text: None))
+                             warn=warn or (lambda _text: None), on_file=on_file)
         self._ms = BlockReducer(BLOCK_1MS, rec_start_n)
         self._ms_blocks = 0
         self._ms_file = None
@@ -699,7 +699,8 @@ class CaptureWorker:
         self._process()
         self.rec = Recorder(Path(params["run_dir"]), self.n_proc,
                             raw_csv=bool(params.get("raw_csv", False)),
-                            warn=lambda text: self._send("warn", text))
+                            warn=lambda text: self._send("warn", text),
+                            on_file=lambda info: self._send("raw_file", info))
         self.pending_snips.clear()
         self._send("rec_started", {"rec_start_n": self.n_proc, "t": time.perf_counter(),
                                    "offset": self.anchors.offset(),

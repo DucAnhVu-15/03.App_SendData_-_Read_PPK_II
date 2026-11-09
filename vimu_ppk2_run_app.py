@@ -57,6 +57,9 @@ AUTOSAVE_MIN_S = 60  # shortest auto-save interval; each snapshot re-reads the r
 # overrides it for one start of the app.
 RAW_CSV = 1
 
+FILES_ROWS_MAX = 2000   # rows kept in the saved-files list (24 h = 1440 raw files)
+FILL_ROWS_MAX = 300     # rows kept in the refill list (one refill every few seconds)
+
 C_APP, C_BG, C_HEADER = vimu.C_APP, vimu.C_BG, vimu.C_HEADER
 C_PANEL, C_PANEL_2, C_PANEL_3 = vimu.C_PANEL, vimu.C_PANEL_2, vimu.C_PANEL_3
 C_FIELD, C_BORDER, C_BORDER_2 = vimu.C_FIELD, vimu.C_BORDER, vimu.C_BORDER_2
@@ -207,185 +210,55 @@ def logic_states(window) -> str:
     return "".join(out)
 
 
-def _decade_label(d: int) -> str:
-    v = 10.0 ** d  # uA
-    if v >= 1000:
-        return f"{v / 1000:g} mA"
-    if v >= 1:
-        return f"{v:g} µA"
-    return f"{v * 1000:g} nA"
+def fmt_bytes(n: float) -> str:
+    if n >= 1e9:
+        return f"{n / 1e9:.2f} GB"
+    if n >= 1e6:
+        return f"{n / 1e6:.1f} MB"
+    return f"{n / 1e3:.0f} kB"
 
 
-def _log_axis(lo_v: float, hi_v: float):
-    lo_v = max(lo_v, 0.1)
-    hi_v = max(hi_v, lo_v * 10)
-    lo = math.floor(math.log10(lo_v))
-    hi = math.ceil(math.log10(hi_v))
-    if hi - lo < 2:
-        lo = hi - 2
-    return lo, hi
+# ── Ring gauge ─────────────────────────────────────────────────────────────
 
+class RingBar(tk.Canvas):
+    """Fill of the STM32 ring as a horizontal bar. The dashed line is the
+    refill threshold: below it the app sends the STM32 new samples."""
 
-# ── Plots ──────────────────────────────────────────────────────────────────
+    def __init__(self, parent: tk.Widget, capacity: int, threshold: int) -> None:
+        super().__init__(parent, bg=C_PANEL, highlightthickness=0, height=30)
+        self.capacity = capacity
+        self.threshold = threshold
+        self.ring: Optional[int] = None
+        self.free: Optional[int] = None
+        self.bind("<Configure>", lambda _e: self.redraw())
 
-class CurrentPlot(tk.Canvas):
-    """Live current, log scale, min-max envelope per pixel, D7 markers."""
-
-    KEEP_S = 600.0
-
-    def __init__(self, parent: tk.Widget) -> None:
-        super().__init__(parent, bg=C_FIELD, highlightthickness=0, height=250)
-        self.window_s = 60.0
-        self._t: deque = deque()
-        self._mean: deque = deque()
-        self._max: deque = deque()
-        self._markers: deque = deque()
-
-    def add(self, t: np.ndarray, mean: np.ndarray, mx: np.ndarray) -> None:
-        if t.size == 0:
-            return
-        self._t.append(t)
-        self._mean.append(mean)
-        self._max.append(mx)
-        cutoff = t[-1] - self.KEEP_S
-        while self._t and self._t[0][-1] < cutoff:
-            self._t.popleft()
-            self._mean.popleft()
-            self._max.popleft()
-        while self._markers and self._markers[0][0] < cutoff:
-            self._markers.popleft()
-
-    def add_marker(self, t: float, color: str) -> None:
-        self._markers.append((t, color))
-
-    def clear_markers(self) -> None:
-        self._markers.clear()
+    def set(self, ring: Optional[int], free: Optional[int]) -> None:
+        if (ring, free) != (self.ring, self.free):
+            self.ring, self.free = ring, free
+            self.redraw()
 
     def redraw(self) -> None:
         self.delete("all")
         w, h = self.winfo_width(), self.winfo_height()
-        if w < 80 or h < 60:
+        if w < 60:
             return
-        L, R, T, B = 64, 12, 10, 22
-        pw, ph = w - L - R, h - T - B
-        if not self._t:
-            self.create_text(w / 2, h / 2, text="Waiting for PPK2 data", fill=C_DIM, font=FONT_UI)
-            return
-        t = np.concatenate(self._t)
-        mean = np.concatenate(self._mean)
-        mx = np.concatenate(self._max)
-        t_right = float(t[-1])
-        t_left = t_right - self.window_s
-        sel = t >= t_left
-        t, mean, mx = t[sel], mean[sel], mx[sel]
-        if t.size == 0:
-            return
-        col = np.clip(((t - t_left) / self.window_s * (pw - 1)).astype(int), 0, pw - 1)
-        starts = np.flatnonzero(np.r_[True, col[1:] != col[:-1]])
-        counts = np.diff(np.r_[starts, col.size])
-        cols = col[starts]
-        mean_c = np.add.reduceat(mean.astype(np.float64), starts) / counts
-        max_c = np.maximum.reduceat(mx, starts)
-        lo, hi = _log_axis(float(np.min(mean_c)), float(np.max(max_c)))
-
-        def ys(v):
-            v = np.maximum(np.asarray(v, dtype=np.float64), 10.0 ** lo)
-            return T + ph * (1 - (np.log10(v) - lo) / (hi - lo))
-
-        for d in range(lo, hi + 1):
-            yy = float(ys(10.0 ** d))
-            self.create_line(L, yy, L + pw, yy, fill=C_BORDER, dash=(2, 4))
-            self.create_text(L - 6, yy, text=_decade_label(d), anchor="e", fill=C_DIM, font=FONT_MONO_SM)
-        for k in range(5):
-            xx = L + pw * k / 4
-            self.create_line(xx, T, xx, T + ph, fill=C_FAINT, dash=(1, 6))
-            label = "now" if k == 4 else f"-{self.window_s * (1 - k / 4):g}s"
-            self.create_text(xx, T + ph + 11, text=label, fill=C_DIM, font=FONT_MONO_SM)
-
-        x = L + cols.astype(np.float64)
-        y_max, y_mean = ys(max_c), ys(mean_c)
-        if x.size >= 2:
-            poly = np.concatenate((np.column_stack((x, y_max)).ravel(),
-                                   np.column_stack((x[::-1], y_mean[::-1])).ravel()))
-            self.create_polygon(*poly.tolist(), fill=blend(C_CYAN, C_FIELD, 0.78), outline="")
-            self.create_line(*np.column_stack((x, y_mean)).ravel().tolist(), fill=C_CYAN, width=1)
-        for tm, color in self._markers:
-            if t_left <= tm <= t_right:
-                xx = L + (tm - t_left) / self.window_s * (pw - 1)
-                self.create_line(xx, T, xx, T + ph, fill=color, dash=(3, 3))
-                self.create_text(xx + 3, T + 6, text="D7", anchor="w", fill=color, font=FONT_MONO_SM)
-        self.create_rectangle(L, T, L + pw, T + ph, outline=C_BORDER)
-
-
-class OverviewPlot(tk.Canvas):
-    """Whole-run view: 1 s average current and D7 ticks."""
-
-    def __init__(self, parent: tk.Widget) -> None:
-        super().__init__(parent, bg=C_FIELD, highlightthickness=0, height=96)
-        self.total_s = 0.0
-        self._sec: list = []
-        self._marks: list = []
-
-    def reset(self, total_s: float) -> None:
-        self.total_s = total_s
-        self._sec = []
-        self._marks = []
-
-    def add_seconds(self, rows) -> None:
-        for sec, mean in rows:
-            while len(self._sec) < sec:
-                self._sec.append(float("nan"))
-            if sec == len(self._sec):
-                self._sec.append(float(mean))
-            else:
-                self._sec[sec] = float(mean)
-
-    def add_mark(self, sec: float, color: str) -> None:
-        self._marks.append((sec, color))
-
-    def redraw(self) -> None:
-        self.delete("all")
-        w, h = self.winfo_width(), self.winfo_height()
-        if w < 80 or h < 40:
-            return
-        L, R, T, B = 64, 12, 8, 18
-        pw, ph = w - L - R, h - T - B
-        n = len(self._sec)
-        span = max(self.total_s, n, 1.0)
-        self.create_rectangle(L, T, L + pw, T + ph, outline=C_BORDER)
-        hours = span / 3600
-        step = 1 if hours <= 6 else (2 if hours <= 12 else 4)
-        hr = 0
-        while hr * 3600 <= span and hours >= 1:
-            xx = L + pw * hr * 3600 / span
-            self.create_text(xx, T + ph + 9, text=f"{hr}h", fill=C_DIM, font=FONT_MONO_SM)
-            hr += step
-        if n == 0:
-            self.create_text(w / 2, h / 2, text="Run overview (1 s averages) appears during a run",
-                             fill=C_DIM, font=FONT_UI_SM)
-            return
-        vals = np.array(self._sec)
-        ok = np.isfinite(vals)
-        if not ok.any():
-            return
-        col = (np.arange(n) / span * (pw - 1)).astype(int)
-        sums = np.bincount(col[ok], weights=vals[ok], minlength=pw)
-        cnts = np.bincount(col[ok], minlength=pw)
-        has = cnts > 0
-        means = sums[has] / cnts[has]
-        xs = np.flatnonzero(has)
-        lo, hi = _log_axis(float(means.min()), float(means.max()))
-        ys = T + ph * (1 - (np.log10(np.maximum(means, 10.0 ** lo)) - lo) / (hi - lo))
-        for d in (lo, hi):
-            self.create_text(L - 6, T + ph * (1 - (d - lo) / (hi - lo)), text=_decade_label(d),
-                             anchor="e", fill=C_DIM, font=FONT_MONO_SM)
-        if xs.size >= 2:
-            self.create_line(*np.column_stack((L + xs, ys)).ravel().tolist(), fill=C_CYAN)
-        for sec, color in self._marks:
-            xx = L + pw * sec / span
-            self.create_line(xx, T + ph - 10, xx, T + ph, fill=color, width=2)
-        xx = L + pw * n / span
-        self.create_line(xx, T, xx, T + ph, fill=C_SUB, dash=(2, 2))
+        x0, x1, y0, y1 = 1, w - 1, 3, h - 3
+        self.create_rectangle(x0, y0, x1, y1, fill=C_FIELD, outline=C_BORDER)
+        if self.ring is not None and self.ring > 0:
+            frac = min(self.ring / self.capacity, 1.0)
+            color = C_YELLOW if self.ring < self.threshold else C_GREEN
+            self.create_rectangle(x0, y0, x0 + (x1 - x0) * frac, y1, outline="",
+                                  fill=blend(color, C_FIELD, 0.55))
+        xt = x0 + (x1 - x0) * self.threshold / self.capacity
+        self.create_line(xt, y0 - 2, xt, y1 + 2, fill=C_SUB, dash=(2, 2))
+        if self.ring is None:
+            text, color = "no ring count from the STM32", C_DIM
+        else:
+            text = f"{self.ring} / {self.capacity} samples  ·  {self.ring / RATE:.1f} s"
+            if self.free is not None:
+                text += f"  ·  free {self.free}"
+            color = C_RED if self.ring == 0 else C_TEXT
+        self.create_text(x0 + 8, h / 2, text=text, anchor="w", fill=color, font=FONT_MONO_SM)
 
 
 # ── Run state ──────────────────────────────────────────────────────────────
@@ -460,7 +333,9 @@ class RunApp:
         self.last_sync: Optional[rs.SyncPoint] = None
         self._quit_pending = False
         self._last_ui = 0.0
-        self._last_overview = 0.0
+        self._last_disk = 0.0
+        self.ring_stats: dict = {}
+        self._reset_ring_stats()
         self._last_pulse_text = "--"
         self._lock_state: Optional[str] = None
         self._ckpt_proc: Optional[subprocess.Popen] = None
@@ -507,7 +382,8 @@ class RunApp:
         self._build_connections(body)
         self._build_runbar(body)
 
-        # Plots/stats above, D7 table/log below, with a draggable divider.
+        # Saved files / ring buffer / stats above, D7 table/log below, with a
+        # draggable divider.
         panes = tk.PanedWindow(body, orient="vertical", bg=C_BORDER, bd=0, sashwidth=7,
                                sashrelief="flat", showhandle=False, opaqueresize=True,
                                sashcursor="sb_v_double_arrow")
@@ -516,7 +392,7 @@ class RunApp:
         middle = tk.Frame(panes, bg=C_APP)
         middle.columnconfigure(0, weight=1)
         middle.rowconfigure(0, weight=1)
-        self._build_plots(middle)
+        self._build_files_ring(middle)
         self._build_stats(middle)
         bottom = tk.Frame(panes, bg=C_APP)
         self._build_table(bottom)
@@ -638,22 +514,75 @@ class RunApp:
         self.autosave_in.set_seconds(autosave_s or 3600)
         self.autosave_in.pack(side="left", padx=(6, 0))
         self._btn(bar, "Open run folder", self._open_folder, C_SUB).pack(side="right", padx=10)
-        self.window_var = tk.StringVar(value="60 s")
-        cb = ttk.Combobox(bar, textvariable=self.window_var, width=7, state="readonly",
-                          values=["10 s", "60 s", "600 s"], style="Vimu.TCombobox")
-        cb.pack(side="right")
-        cb.bind("<<ComboboxSelected>>", self._on_window_change)
-        tk.Label(bar, text="Plot window", bg=C_PANEL, fg=C_DIM, font=FONT_UI_XS).pack(side="right", padx=6)
 
-    def _build_plots(self, parent: tk.Widget) -> None:
+    def _build_files_ring(self, parent: tk.Widget) -> None:
+        """Two columns where the current plot used to be: the files saved so
+        far in this run, and the STM32 ring buffer."""
+        area = tk.Frame(parent, bg=C_APP)
+        area.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        area.columnconfigure(0, weight=3, minsize=360)
+        area.columnconfigure(1, weight=2, minsize=320)
+        area.rowconfigure(0, weight=1)
+        self._build_files(area)
+        self._build_ring(area)
+
+    def _table(self, parent: tk.Widget, cols: list, stretch: str, height: int) -> ttk.Treeview:
+        """A Treeview with its scrollbar, packed to fill the rest of parent."""
+        holder = tk.Frame(parent, bg=C_PANEL)
+        holder.pack(fill="both", expand=True, padx=(8, 6), pady=(0, 8))
+        table = ttk.Treeview(holder, columns=[c[0] for c in cols], show="headings",
+                             style="Run.Treeview", height=height)
+        for key, title, width in cols:
+            table.heading(key, text=title, anchor="w")
+            table.column(key, width=width, minwidth=40, anchor="w", stretch=key == stretch)
+        sb = ttk.Scrollbar(holder, orient="vertical", command=table.yview)
+        table.configure(yscrollcommand=sb.set)
+        table.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+        return table
+
+    def _build_files(self, parent: tk.Widget) -> None:
         frame = tk.Frame(parent, bg=C_PANEL, highlightthickness=1, highlightbackground=C_BORDER)
         frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        tk.Label(frame, text="Current (log scale)  ·  dashed lines = D7 pulses", bg=C_PANEL,
-                 fg=C_SUB, font=FONT_UI_XS, anchor="w").pack(fill="x", padx=10, pady=(6, 0))
-        self.plot = CurrentPlot(frame)
-        self.plot.pack(fill="both", expand=True, padx=8, pady=(2, 4))
-        self.overview = OverviewPlot(frame)
-        self.overview.pack(fill="x", padx=8, pady=(0, 8))
+        self.files_title_var = tk.StringVar(value="Saved files")
+        tk.Label(frame, textvariable=self.files_title_var, bg=C_PANEL, fg=C_SUB, font=FONT_UI_XS,
+                 anchor="w").pack(fill="x", padx=10, pady=(6, 2))
+        self.files_table = self._table(frame, [
+            ("saved", "Saved at", 72), ("file", "File", 190), ("data", "Data (PPK2 time)", 150),
+            ("npz", "NPZ", 66), ("csv", "CSV", 70)], stretch="file", height=6)
+        for tag, color in (("raw", C_TEXT), ("ckpt", C_CYAN), ("final", C_GREEN)):
+            self.files_table.tag_configure(tag, foreground=color)
+
+    def _build_ring(self, parent: tk.Widget) -> None:
+        frame = tk.Frame(parent, bg=C_PANEL, highlightthickness=1, highlightbackground=C_BORDER)
+        frame.grid(row=0, column=1, sticky="nsew")
+        cap, thr = vimu.RING_CAPACITY, self.args.refill_threshold * RATE
+        tk.Label(frame, text=f"VIMU ring buffer  ·  {cap} samples = {cap / RATE:g} s  ·  "
+                             f"refill below {self.args.refill_threshold} s (dashed)",
+                 bg=C_PANEL, fg=C_SUB, font=FONT_UI_XS, anchor="w").pack(fill="x", padx=10, pady=(6, 2))
+        self.ring_bar = RingBar(frame, cap, thr)
+        self.ring_bar.pack(fill="x", padx=10, pady=(0, 4))
+        grid = tk.Frame(frame, bg=C_PANEL)
+        grid.pack(fill="x", padx=10, pady=(0, 6))
+        self.ring_vars: dict = {}
+        self.ring_lbls: dict = {}
+        for r, (key, label) in enumerate((("state", "State"), ("flags", "Flags"),
+                                          ("sent", "NPZ samples"), ("fills", "Refills"),
+                                          ("min", "Lowest ring"), ("under", "Underruns"))):
+            tk.Label(grid, text=label, bg=C_PANEL, fg=C_DIM, font=FONT_UI_SM,
+                     anchor="w").grid(row=r, column=0, sticky="w", padx=(0, 10))
+            var = tk.StringVar(value="--")
+            lbl = tk.Label(grid, textvariable=var, bg=C_PANEL, fg=C_DIM, font=FONT_MONO_SM, anchor="w")
+            lbl.grid(row=r, column=1, sticky="w")
+            self.ring_vars[key] = var
+            self.ring_lbls[key] = lbl
+        tk.Label(frame, text="Refills (newest first)", bg=C_PANEL, fg=C_SUB, font=FONT_UI_XS,
+                 anchor="w").pack(fill="x", padx=10, pady=(0, 2))
+        self.fill_table = self._table(frame, [
+            ("t", "Time", 72), ("kind", "Kind", 62), ("before", "Ring before", 96),
+            ("sent", "Sent", 70), ("cursor", "NPZ cursor", 90)], stretch="cursor", height=4)
+        for tag, color in (("refill", C_TEXT), ("prefill", C_CYAN), ("short", C_YELLOW)):
+            self.fill_table.tag_configure(tag, foreground=color)
 
     def _build_stats(self, parent: tk.Widget) -> None:
         # Scrollable: on a short screen the panel is cut, so its content sits
@@ -1075,10 +1004,10 @@ class RunApp:
         self.clock = rs.PlayClock()
         self.last_sync = None
         self.rec_stats = None
-        self.plot.clear_markers()
-        self.overview.reset(total_s=(end_idx - start_idx) / RATE)
-        for item in self.table.get_children():
-            self.table.delete(item)
+        self._reset_ring_stats()
+        for table in (self.table, self.files_table, self.fill_table):
+            table.delete(*table.get_children())
+        self._refresh_files_title()
         self._last_pulse_text = "--"
         self.status_var.set(f"Run folder: {run_dir}")
 
@@ -1195,6 +1124,7 @@ class RunApp:
             self._log(f"[WARN] Could not delete {run.run_dir}: {exc}", "warn")
         else:
             self._log(f"[APP] Run discarded, deleted {run.run_dir.name}", "warn")
+            self.files_table.delete(*self.files_table.get_children())
         if self.run is run:
             self.run = None
         if self.last_run_dir == run.run_dir:
@@ -1212,6 +1142,7 @@ class RunApp:
             for line in analyze_run.format_summary(summary).splitlines():
                 self._log(line, "ok" if line and not line.startswith(" ") else "")
             self._log(f"[APP] Results in {run.run_dir}", "ok")
+            self._add_file_row(time.time(), "summary.*, d7_events.csv", "whole run", tag="final")
         try:
             run.log_file.close()
         except Exception:
@@ -1276,11 +1207,11 @@ class RunApp:
                 self._last_ui = now
                 self._autosave_tick(now)
                 self._refresh_stats(now)
+                self._refresh_ring()
                 self._update_controls()
-                self.plot.redraw()
-            if now - self._last_overview >= 2.0:
-                self._last_overview = now
-                self.overview.redraw()
+            if now - self._last_disk >= 10.0:
+                self._last_disk = now
+                self._refresh_files_title()
         except Exception:
             self._log("[ERROR] GUI tick: " + traceback.format_exc().strip().splitlines()[-1], "error")
         finally:
@@ -1340,8 +1271,16 @@ class RunApp:
         if kind == "sync":
             self.clock.add(data.t, data.played)
             self.last_sync = data
+            # The ring empties for good at the end of the data; that is not a low.
+            if run is not None and data.cursor < run.end_idx:
+                low = self.ring_stats["min"]
+                self.ring_stats["min"] = data.ring if low is None else min(low, data.ring)
+        elif kind == "ring_fill":
+            self._on_ring_fill(data)
         elif kind == "run_event":
             t, ev_kind, detail = data
+            if ev_kind == "ring_underrun":
+                self.ring_stats["underruns"] += 1
             self._event("stm32", ev_kind, detail, t=t, log=False)
         elif kind == "run_armed" and run is not None and self.phase == "ARMING":
             self._event("app", "armed", f"prefill {data['prefill']} samples; {data['status']}")
@@ -1379,6 +1318,8 @@ class RunApp:
             self._on_live(data)
         elif kind == "pulse":
             self._on_pulse(data)
+        elif kind == "raw_file":
+            self._on_raw_file(data)
         elif kind == "log":
             self._log(f"[PPK2] {data}")
         elif kind == "warn":
@@ -1448,15 +1389,10 @@ class RunApp:
 
     def _on_live(self, d: dict) -> None:
         self.ppk_live = d
-        if d["g_n0"] is not None and d["g_mean"].size and d["offset"] is not None:
-            k = d["g_mean"].size
-            n_mid = d["g_n0"] + (np.arange(k) + 0.5) * d["g_block"]
-            t = n_mid * rs.PPK2_PERIOD_S + d["offset"]
-            self.plot.add(t, d["g_mean"], d["g_max"])
+        if d["g_mean"].size:
             self.recent_blocks.extend(d["g_mean"].tolist())
         if d["rec"] is not None and self.run is not None:
             self.rec_stats = d["rec"]
-            self.overview.add_seconds(d["rec"]["seconds"])
         self.logic_window.append(d.get("logic"))
         if self.ppk_connected:
             if self.ppk_link == "reconnecting":
@@ -1522,6 +1458,9 @@ class RunApp:
             return
         run.ckpt_count += 1
         run.last_ckpt_label = label
+        if run is self.run:
+            self._add_file_row(time.time(), f"checkpoints/{label}_summary.*",
+                               f"run to {label}", tag="ckpt")
         detail = f"{label} saved"
         try:
             s = json.loads((run.run_dir / "summary.json").read_text(encoding="utf-8"))
@@ -1564,8 +1503,6 @@ class RunApp:
         run = self.run
         t = d["t_est"]
         if run is None or not d["recording"] or self.phase not in ACTIVE_PHASES + ("STOPPING",):
-            if t is not None:
-                self.plot.add_marker(t, C_FAINT)
             now = time.perf_counter()
             if now - self._idle_pulse_logged_at > 10:
                 self._idle_pulse_logged_at = now
@@ -1589,11 +1526,6 @@ class RunApp:
                                                   int(self.args.tolerance * RATE),
                                                   int(self.args.warmup * RATE), run.detected)
         run.counts[verdict] = run.counts.get(verdict, 0) + 1
-        color = VERDICT_COLORS.get(verdict, C_SUB)
-        if t is not None:
-            self.plot.add_marker(t, color)
-        if d["n_rel"] is not None:
-            self.overview.add_mark(d["n_rel"] * rs.PPK2_PERIOD_S, color)
 
         t_run = rs.fmt_hms(t - run.t_go, 1) if (t is not None and run.t_go is not None) else "--"
         activity = " · ".join(x for x in (lab["category"], lab["phase"], lab["task"]) if x)
@@ -1710,11 +1642,95 @@ class RunApp:
             for key in ("pulses", "fp", "tp", "last"):
                 self._set_stat(key, "--", C_DIM)
 
-    # ── Misc ───────────────────────────────────────────────────────────────
+    # ── Saved files and ring buffer ────────────────────────────────────────
 
-    def _on_window_change(self, _event=None) -> None:
-        self.plot.window_s = float(self.window_var.get().split()[0])
-        self.plot.redraw()
+    def _reset_ring_stats(self) -> None:
+        self.ring_stats = {"fills": 0, "walls": deque(maxlen=50), "min": None, "underruns": 0}
+
+    def _add_file_row(self, wall: float, name: str, data: str, npz: str = "",
+                      csv_size: str = "", tag: str = "raw") -> None:
+        self.files_table.insert("", 0, values=(
+            datetime.fromtimestamp(wall).strftime("%H:%M:%S"), name, data, npz, csv_size),
+            tags=(tag,))
+        children = self.files_table.get_children()
+        if len(children) > FILES_ROWS_MAX:
+            self.files_table.delete(*children[FILES_ROWS_MAX:])
+
+    def _on_raw_file(self, d: dict) -> None:
+        """One raw minute saved by the PPK2 process: ppk_raw/raw_<time>.npz (+ .csv)."""
+        a = d["t0_ms"] / 1000
+        b = a + d["rows"] / pc.SAMPLE_RATE_HZ
+        self._add_file_row(d["t_wall"], f"{ppk_raw.RAW_DIR}/{d['name']}.npz",
+                           f"{rs.fmt_hms(a)} – {rs.fmt_hms(b)}", fmt_bytes(d["npz_bytes"]),
+                           fmt_bytes(d["csv_bytes"]) if d["csv_bytes"] else "--")
+
+    def _refresh_files_title(self) -> None:
+        try:
+            free = f"{shutil.disk_usage(self.runs_dir.resolve().anchor).free / 1e9:.0f} GB free"
+        except OSError:
+            free = "free space unknown"
+        where = self.last_run_dir.name if self.last_run_dir is not None else "no run yet"
+        self.files_title_var.set(f"Saved files  ·  {where}  ·  {free}")
+
+    def _on_ring_fill(self, d: dict) -> None:
+        """One prefill or refill of the STM32 ring by the UART thread."""
+        if d["kind"] == "refill":
+            self.ring_stats["fills"] += 1
+            self.ring_stats["walls"].append(d["wall"])
+        before = d["ring_before"]
+        short = d["sent"] < d["requested"]
+        self.fill_table.insert("", 0, values=(
+            datetime.fromtimestamp(d["wall"]).strftime("%H:%M:%S"), d["kind"],
+            "--" if before is None else f"{before}  ({before / RATE:.1f} s)",
+            f"+{d['sent']}" + (f"/{d['requested']}" if short else ""),
+            f"{d['cursor']:,}"), tags=("short" if short else d["kind"],))
+        children = self.fill_table.get_children()
+        if len(children) > FILL_ROWS_MAX:
+            self.fill_table.delete(*children[FILL_ROWS_MAX:])
+
+    def _set_ring(self, key: str, text: str, color: str = C_TEXT) -> None:
+        self.ring_vars[key].set(text)
+        self.ring_lbls[key].config(fg=color)
+
+    def _refresh_ring(self) -> None:
+        st = self.stm_status if self.stm_connected else None
+        self.ring_bar.set(None if st is None else st.ring_samples,
+                          None if st is None else st.free_samples)
+        if st is None:
+            self._set_ring("state", "connected" if self.stm_connected else "disconnected", C_DIM)
+            self._set_ring("flags", "--", C_DIM)
+        else:
+            running = st.state == vimu.VIMU_STATE_RUNNING
+            self._set_ring("state", f"{st.state_name}  ·  level {st.level_name}",
+                           C_GREEN if running else C_YELLOW)
+            self._set_ring("flags", ", ".join(st.flag_names),
+                           C_RED if running and st.ring_empty else C_TEXT)
+
+        run, sp, info = self.run, self.last_sync, self.ring_stats
+        if run is not None and run.t_go is not None and sp is not None:
+            self._set_ring("sent", f"{sp.cursor - run.start_idx:,} sent  ·  {sp.played:,} played")
+        else:
+            self._set_ring("sent", "--", C_DIM)
+        walls = info["walls"]
+        if info["fills"]:
+            every = (f"  ·  every {(walls[-1] - walls[0]) / (len(walls) - 1):.1f} s"
+                     if len(walls) > 1 else "")
+            self._set_ring("fills", f"{info['fills']}{every}")
+        else:
+            self._set_ring("fills", "--" if run is None else "0", C_DIM)
+        low = info["min"]
+        if low is None:
+            self._set_ring("min", "--", C_DIM)
+        else:
+            self._set_ring("min", f"{low}  ({low / RATE:.1f} s)",
+                           C_RED if low == 0 else (C_YELLOW if low < 3 * RATE else C_TEXT))
+        if run is None:
+            self._set_ring("under", "--", C_DIM)
+        else:
+            n = info["underruns"]
+            self._set_ring("under", str(n), C_RED if n else C_TEXT)
+
+    # ── Misc ───────────────────────────────────────────────────────────────
 
     def _open_folder(self) -> None:
         target = self.last_run_dir or self.runs_dir

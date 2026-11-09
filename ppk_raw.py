@@ -40,6 +40,7 @@ import re
 import shutil
 import sys
 import threading
+import time
 import zipfile
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
@@ -111,7 +112,8 @@ class RawWriter:
     """
 
     def __init__(self, run_dir, n_start: int, csv_on: bool,
-                 warn: Callable[[str], None] = print, file_s: float = FILE_S) -> None:
+                 warn: Callable[[str], None] = print, file_s: float = FILE_S,
+                 on_file: Optional[Callable[[dict], None]] = None) -> None:
         self.dir = Path(run_dir) / RAW_DIR
         self.dir.mkdir(parents=True, exist_ok=True)
         self.n_start = int(n_start)
@@ -119,6 +121,7 @@ class RawWriter:
         self.csv_on = bool(csv_on)
         self.npz_on = True
         self._warn = warn
+        self._on_file = on_file      # called from the thread after each saved file
         self.fed = 0             # samples queued
         self.done = 0            # samples taken off the queue by the thread
         self.saved = 0           # samples in finished NPZ files
@@ -224,20 +227,31 @@ class RawWriter:
         if k == 0:
             return
         n_rel = self._file_n_rel
-        self.npz_bytes += save_npz(self.dir / (file_stem(n_rel) + ".npz"), {
+        stem = file_stem(n_rel)
+        npz_size = save_npz(self.dir / (stem + ".npz"), {
             "current_uA": self._cur[:k], "d0_d7": self._bits[:k],
             "t0_ms": np.float64(n_rel * DT_MS), "dt_ms": np.float64(DT_MS),
             "n_rel_start": np.int64(n_rel), "n_start": np.int64(self.n_start + n_rel)})
+        self.npz_bytes += npz_size
         self.files += 1
         self.saved += k
+        csv_size = 0
         if self._csv is not None:
             self._csv.close()
             self._csv = None
             os.replace(_part(self._csv_path), self._csv_path)
-            self.csv_bytes += self._csv_path.stat().st_size
+            csv_size = self._csv_path.stat().st_size
+            self.csv_bytes += csv_size
             self.csv_files += 1
         self._file_n_rel += k
         self._fill = 0
+        if self._on_file is not None:
+            try:  # a failed notice must not stop the recording
+                self._on_file({"name": stem, "rows": k, "t0_ms": n_rel * DT_MS,
+                               "npz_bytes": npz_size, "csv_bytes": csv_size,
+                               "t_wall": time.time()})
+            except Exception:
+                pass
 
     def _fail(self, exc: Exception) -> None:
         self.error = f"{type(exc).__name__}: {exc}"
