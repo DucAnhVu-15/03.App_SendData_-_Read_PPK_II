@@ -110,7 +110,7 @@ The snapshot runs `analyze_run.py` in a separate process, so it does not slow th
 | PRE-ROLL | 1 s of baseline current before any data plays. |
 | GO | STM32 `START`. Its ACK time is `t_go`, and `t_run = 0` from there. |
 | RUN | Auto refill below 7 s of data. Every 0.5 s `UPDATE` poll logs `played = cursor − ring_samples`. |
-| STOP | STM32 `STOP`, PPK2 recording closed, `analyze_run.py` runs. |
+| STOP | STM32 `STOP` and `CLEAR`, PPK2 recording closed, `analyze_run.py` runs. The ring is emptied because any write that sets the ESP32's `CTRL_REG1` ACTIVE makes the STM32 RUNNING, and that happens at a DUT power-on or a re-init. Samples left in the ring would then play by themselves outside a run. After a run, an idle STM32 that shows `RUNNING · ring 0/500` therefore means the ESP32 is up and nothing is waiting to play. |
 
 If nothing reaches GO within 60 s, the run is aborted with an error.
 

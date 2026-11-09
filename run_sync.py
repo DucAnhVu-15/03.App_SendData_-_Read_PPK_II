@@ -423,8 +423,12 @@ class RunMonitorThread(vimu.MonitorThread):
         self.set_auto_refill(False)
         try:
             self._ack_cmd(io, vimu.VIMU_UART_CMD_STOP, "STOP")
+            # Empty the ring too. Samples left in it would play by themselves
+            # the next time the ESP32 sets the sensor ACTIVE (DUT power on, or a
+            # re-init), since that write alone makes the STM32 RUNNING again.
+            self._ack_cmd(io, vimu.VIMU_UART_CMD_CLEAR, "CLEAR")
         except Exception as exc:
-            self._log(f"[WARN] STOP at the end of the run failed: {exc}")
+            self._log(f"[WARN] STOP/CLEAR at the end of the run failed: {exc}")
         finally:
             self._run_cfg = None
             self._close_sync_file()

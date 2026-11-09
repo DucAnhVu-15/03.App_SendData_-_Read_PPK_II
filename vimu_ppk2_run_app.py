@@ -171,6 +171,16 @@ def fmt_current(ua: Optional[float]) -> str:
     return f"{ua * 1000:.0f} nA"
 
 
+# Steady flags first. IRQ_ACTIVE follows the FIFO interrupt and toggles all the
+# time, so it goes last, where coming and going does not shift the others.
+FLAG_ORDER = ("I2C_ENABLE", "BUFFER_LOW", "FIFO_FULL", "RING_EMPTY", "IRQ_ACTIVE")
+
+
+def flag_text(st) -> str:
+    names = set(st.flag_names)
+    return ", ".join(n for n in FLAG_ORDER if n in names) or "NONE"
+
+
 def raw_stat(raw: dict) -> tuple:
     """Text and colour of the 'Raw 100 kS/s' line in the PPK2 stats."""
     if not raw["npz_on"]:
@@ -449,8 +459,7 @@ class RunApp:
         self.stm_btn = self._btn(inner, "Connect", self._stm_toggle, C_BLUE, width=10)
         self.stm_btn.grid(row=0, column=2)
         self.stm_info_var = tk.StringVar(value="disconnected")
-        self._label(inner, textvariable=self.stm_info_var, fg=C_DIM, font=FONT_MONO_SM,
-                    anchor="w").grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        self._info_line(inner, self.stm_info_var, row=1, columns=3)
 
         # PPK2
         card, inner = self._card(row, "PPK2  (source meter, D7 = model FALL)")
@@ -468,8 +477,7 @@ class RunApp:
         self.dut_btn = self._btn(inner, "DUT OFF", self._dut_toggle, C_DIM, width=9)
         self.dut_btn.grid(row=0, column=4)
         self.ppk_info_var = tk.StringVar(value="disconnected")
-        self._label(inner, textvariable=self.ppk_info_var, fg=C_DIM, font=FONT_MONO_SM,
-                    anchor="w").grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
+        self._info_line(inner, self.ppk_info_var, row=1, columns=5)
 
         # NPZ
         card, inner = self._card(row, "NPZ recording")
@@ -486,8 +494,16 @@ class RunApp:
         self._label(inner, "h : m : s", fg=C_DIM, font=FONT_UI_XS).grid(
             row=0, column=3, rowspan=2, sticky="w", padx=(8, 0))
         self.npz_info_var = tk.StringVar(value="no file loaded")
-        self._label(inner, textvariable=self.npz_info_var, fg=C_DIM, font=FONT_MONO_SM,
-                    anchor="w").grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        self._info_line(inner, self.npz_info_var, row=2, columns=4)
+
+    def _info_line(self, parent: tk.Widget, var: tk.StringVar, row: int, columns: int) -> None:
+        """Status text under a card's controls. width=1 plus a stretching
+        spare column make its size come from the card, never from the text,
+        so a longer text cannot push the controls around (it is cut instead)."""
+        parent.columnconfigure(columns, weight=1)
+        self._label(parent, textvariable=var, fg=C_DIM, font=FONT_MONO_SM, anchor="w",
+                    width=1).grid(row=row, column=0, columnspan=columns + 1, sticky="ew",
+                                  pady=(6, 0))
 
     def _build_runbar(self, parent: tk.Widget) -> None:
         bar = tk.Frame(parent, bg=C_PANEL, highlightthickness=1, highlightbackground=C_BORDER)
@@ -545,8 +561,9 @@ class RunApp:
         frame = tk.Frame(parent, bg=C_PANEL, highlightthickness=1, highlightbackground=C_BORDER)
         frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         self.files_title_var = tk.StringVar(value="Saved files")
+        # width=1: the column width comes from the layout, not from this text.
         tk.Label(frame, textvariable=self.files_title_var, bg=C_PANEL, fg=C_SUB, font=FONT_UI_XS,
-                 anchor="w").pack(fill="x", padx=10, pady=(6, 2))
+                 anchor="w", width=1).pack(fill="x", padx=10, pady=(6, 2))
         self.files_table = self._table(frame, [
             ("saved", "Saved at", 72), ("file", "File", 190), ("data", "Data (PPK2 time)", 150),
             ("npz", "NPZ", 66), ("csv", "CSV", 70)], stretch="file", height=6)
@@ -564,6 +581,7 @@ class RunApp:
         self.ring_bar.pack(fill="x", padx=10, pady=(0, 4))
         grid = tk.Frame(frame, bg=C_PANEL)
         grid.pack(fill="x", padx=10, pady=(0, 6))
+        grid.columnconfigure(1, weight=1)
         self.ring_vars: dict = {}
         self.ring_lbls: dict = {}
         for r, (key, label) in enumerate((("state", "State"), ("flags", "Flags"),
@@ -572,8 +590,10 @@ class RunApp:
             tk.Label(grid, text=label, bg=C_PANEL, fg=C_DIM, font=FONT_UI_SM,
                      anchor="w").grid(row=r, column=0, sticky="w", padx=(0, 10))
             var = tk.StringVar(value="--")
-            lbl = tk.Label(grid, textvariable=var, bg=C_PANEL, fg=C_DIM, font=FONT_MONO_SM, anchor="w")
-            lbl.grid(row=r, column=1, sticky="w")
+            # width=1 + sticky ew: a longer value never widens the column.
+            lbl = tk.Label(grid, textvariable=var, bg=C_PANEL, fg=C_DIM, font=FONT_MONO_SM,
+                           anchor="w", width=1)
+            lbl.grid(row=r, column=1, sticky="ew")
             self.ring_vars[key] = var
             self.ring_lbls[key] = lbl
         tk.Label(frame, text="Refills (newest first)", bg=C_PANEL, fg=C_SUB, font=FONT_UI_XS,
@@ -1124,7 +1144,8 @@ class RunApp:
             self._log(f"[WARN] Could not delete {run.run_dir}: {exc}", "warn")
         else:
             self._log(f"[APP] Run discarded, deleted {run.run_dir.name}", "warn")
-            self.files_table.delete(*self.files_table.get_children())
+            for table in (self.files_table, self.fill_table):
+                table.delete(*table.get_children())
         if self.run is run:
             self.run = None
         if self.last_run_dir == run.run_dir:
@@ -1398,9 +1419,12 @@ class RunApp:
             if self.ppk_link == "reconnecting":
                 self.ppk_info_var.set("link lost, reconnecting…")
             else:
-                self.ppk_info_var.set(f"{d['rate'] / 1000:.1f} kS/s  ·  DUT {'ON' if d['dut'] else 'OFF'}"
-                                      f"  ·  D7 pulses {d['rises']}"
-                                      f"  ·  D0-D7 {logic_states(self.logic_window)}")
+                # Fixed-width fields, and the growing pulse count last, so a
+                # changing number never shifts the text after it.
+                dut = "ON" if d["dut"] else "OFF"
+                self.ppk_info_var.set(f"{d['rate'] / 1000:5.1f} kS/s  ·  DUT {dut:<3}"
+                                      f"  ·  D0-D7 {logic_states(self.logic_window)}"
+                                      f"  ·  D7 pulses {d['rises']}")
 
     # ── Auto-save snapshots ────────────────────────────────────────────────
 
@@ -1548,8 +1572,10 @@ class RunApp:
         run = self.run
         st = self.stm_status
         if self.stm_connected and st is not None:
-            ring = f"{st.ring_samples}/{vimu.RING_CAPACITY}" if st.ring_samples is not None else st.level_name
-            self.stm_info_var.set(f"{st.state_name}  ·  ring {ring}  ·  {', '.join(st.flag_names)}")
+            # Fixed-width fields, flags in a steady order (see FLAG_ORDER).
+            ring = (f"{st.ring_samples:>3}/{vimu.RING_CAPACITY}" if st.ring_samples is not None
+                    else st.level_name)
+            self.stm_info_var.set(f"{st.state_name:<7}  ·  ring {ring:>7}  ·  {flag_text(st)}")
         elif self.stm_connected:
             self.stm_info_var.set("connected")
 
@@ -1703,7 +1729,7 @@ class RunApp:
             running = st.state == vimu.VIMU_STATE_RUNNING
             self._set_ring("state", f"{st.state_name}  ·  level {st.level_name}",
                            C_GREEN if running else C_YELLOW)
-            self._set_ring("flags", ", ".join(st.flag_names),
+            self._set_ring("flags", flag_text(st),
                            C_RED if running and st.ring_empty else C_TEXT)
 
         run, sp, info = self.run, self.last_sync, self.ring_stats
@@ -1711,15 +1737,18 @@ class RunApp:
             self._set_ring("sent", f"{sp.cursor - run.start_idx:,} sent  ·  {sp.played:,} played")
         else:
             self._set_ring("sent", "--", C_DIM)
+        # Refills, lowest ring and underruns belong to a run; without one, show none.
         walls = info["walls"]
-        if info["fills"]:
+        if run is None:
+            self._set_ring("fills", "--", C_DIM)
+        elif info["fills"]:
             every = (f"  ·  every {(walls[-1] - walls[0]) / (len(walls) - 1):.1f} s"
                      if len(walls) > 1 else "")
             self._set_ring("fills", f"{info['fills']}{every}")
         else:
-            self._set_ring("fills", "--" if run is None else "0", C_DIM)
+            self._set_ring("fills", "0", C_DIM)
         low = info["min"]
-        if low is None:
+        if run is None or low is None:
             self._set_ring("min", "--", C_DIM)
         else:
             self._set_ring("min", f"{low}  ({low / RATE:.1f} s)",
