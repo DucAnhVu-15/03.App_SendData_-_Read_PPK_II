@@ -57,6 +57,14 @@ AUTOSAVE_MIN_S = 60  # shortest auto-save interval; each snapshot re-reads the r
 # overrides it for one start of the app.
 RAW_CSV = 1
 
+# 1 = a run folder holds only ppk_raw/: the raw NPZ (+ CSV twin) files and
+# d7_ids.csv, one row per D7 pulse: its id, the raw file and the Timestamp(ms)
+# of its rising edge in that file. No logs, sync, anchors, snippets, summaries
+# or auto-save checkpoints, so analyze_run.py cannot re-analyse such a run.
+# 0 = save everything as before.
+SAVE_RAW_AND_D7_ONLY = 1
+D7_IDS_HEADER = ["id", "raw_file", "timestamp_ms"]
+
 FILES_ROWS_MAX = 2000   # rows kept in the saved-files list (24 h = 1440 raw files)
 FILL_ROWS_MAX = 300     # rows kept in the refill list (one refill every few seconds)
 
@@ -282,6 +290,8 @@ class RunState:
     events_file: object = None
     events_writer: object = None
     log_file: object = None
+    d7_file: object = None          # ppk_raw/d7_ids.csv (SAVE_RAW_AND_D7_ONLY)
+    d7_writer: object = None
     t_go: Optional[float] = None
     rec_requested: bool = False
     rec_started: bool = False
@@ -1012,10 +1022,17 @@ class RunApp:
         }
         run = RunState(run_dir=run_dir, start_idx=start_idx, end_idx=end_idx, session=session)
         run.counts = {k: 0 for k in ("FP", "TP", "DUP", "WARMUP", "PREROLL", "GLITCH")}
-        run.events_file = open(run_dir / "run_events.csv", "w", newline="", encoding="utf-8")
-        run.events_writer = csv.writer(run.events_file)
-        run.events_writer.writerow(["t_host", "t_run_s", "wall", "source", "kind", "detail"])
-        run.log_file = open(run_dir / "app_log.txt", "w", encoding="utf-8")
+        if SAVE_RAW_AND_D7_ONLY:
+            (run_dir / ppk_raw.RAW_DIR).mkdir()
+            run.d7_file = open(run_dir / ppk_raw.RAW_DIR / "d7_ids.csv", "w", newline="",
+                               encoding="utf-8")
+            run.d7_writer = csv.writer(run.d7_file)
+            run.d7_writer.writerow(D7_IDS_HEADER)
+        else:
+            run.events_file = open(run_dir / "run_events.csv", "w", newline="", encoding="utf-8")
+            run.events_writer = csv.writer(run.events_file)
+            run.events_writer.writerow(["t_host", "t_run_s", "wall", "source", "kind", "detail"])
+            run.log_file = open(run_dir / "app_log.txt", "w", encoding="utf-8")
         self.run = run
         self.last_run_dir = run_dir
         self._write_session()
@@ -1036,7 +1053,8 @@ class RunApp:
         self._event("app", "arm", f"NPZ {start_idx}..{end_idx} "
                                   f"({rs.fmt_hms(start_idx / RATE)} + {rs.fmt_hms((end_idx - start_idx) / RATE)})")
         self.stm.push_cmd(("run_arm", {"start": start_idx, "end": end_idx,
-                                       "sync_csv": str(run_dir / "sync_log.csv")}))
+                                       "sync_csv": None if SAVE_RAW_AND_D7_ONLY
+                                       else str(run_dir / "sync_log.csv")}))
         self.root.after(60000, lambda r=run: self._arm_watchdog(r))
 
     def _log_raw_estimate(self, run_dir: Path, hours: float) -> None:
@@ -1100,7 +1118,7 @@ class RunApp:
         run = self.run
         self._stop_checkpoint()
         if run.discard:
-            for f in (run.events_file, run.log_file):
+            for f in (run.events_file, run.log_file, run.d7_file):
                 try:
                     f.close()
                 except Exception:
@@ -1115,6 +1133,17 @@ class RunApp:
         s["wall_stop"] = datetime.now().isoformat(timespec="milliseconds")
         s["live_counts"] = run.counts
         self._write_session()
+        if SAVE_RAW_AND_D7_ONLY:
+            # Nothing to analyse: the D7 ids were written live.
+            self._event("app", "finished", f"status={run.status}")
+            run.d7_file.close()
+            run.d7_writer = None
+            self._log(f"[APP] Results in {run.run_dir / ppk_raw.RAW_DIR}", "ok")
+            keep_awake(False)
+            self._set_phase("DONE")
+            if self._quit_pending:
+                self._quit()
+            return
         self._event("app", "finished", f"status={run.status}, analysing…")
         run.events_file.close()
         run.events_writer = None
@@ -1176,7 +1205,7 @@ class RunApp:
 
     def _write_session(self) -> None:
         run = self.run
-        if run is None:
+        if run is None or SAVE_RAW_AND_D7_ONLY:
             return
         tmp = run.run_dir / "session.json.tmp"
         tmp.write_text(json.dumps(run.session, indent=2), encoding="utf-8")
@@ -1308,7 +1337,8 @@ class RunApp:
             self._set_phase("REC_WAIT")
             run.rec_requested = True
             self.ppk.send("rec_start", {"run_dir": str(run.run_dir),
-                                        "raw_csv": bool(self.args.raw_csv)})
+                                        "raw_csv": bool(self.args.raw_csv),
+                                        "raw_only": bool(SAVE_RAW_AND_D7_ONLY)})
         elif kind == "run_go" and run is not None and self.phase == "PREROLL":
             run.t_go = data["t_go"]
             self.clock.add(run.t_go, 0)
@@ -1434,7 +1464,7 @@ class RunApp:
     def _autosave_tick(self, now: float) -> None:
         self._poll_checkpoint()
         run = self.run
-        if (not self.autosave_var.get() or run is None or run.t_go is None
+        if (SAVE_RAW_AND_D7_ONLY or not self.autosave_var.get() or run is None or run.t_go is None
                 or self.phase not in ("RUNNING", "TAIL") or self._ckpt_proc is not None):
             return
         t_run = now - run.t_go
@@ -1557,6 +1587,13 @@ class RunApp:
             d["rise_no"], t_run, rs.fmt_hms(idx / RATE, 1) if idx is not None else "--",
             idx if idx is not None else "--", activity or "--", verdict,
             f"{d['width'] / 100:.2f} ms"), tags=(verdict,))
+        n_rel = d.get("n_rel")
+        if run.d7_writer is not None and n_rel is not None:
+            run.d7_writer.writerow([
+                d["rise_no"],
+                ppk_raw.file_stem(n_rel - n_rel % (ppk_raw.FILE_S * pc.SAMPLE_RATE_HZ)),
+                f"{n_rel * ppk_raw.DT_MS:.2f}"])   # = Timestamp(ms) of the rising edge in the raw CSV
+            run.d7_file.flush()
         children = self.table.get_children()
         if len(children) > 500:
             self.table.delete(*children[500:])

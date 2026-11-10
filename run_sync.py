@@ -583,10 +583,12 @@ class RunMonitorThread(vimu.MonitorThread):
                 self._sync_file.flush()
         self._sq.put(("sync", sp))
 
-    def _open_sync_file(self, path: str, append: bool) -> None:
+    def _open_sync_file(self, path: Optional[str], append: bool) -> None:
         self._close_sync_file()
-        new = not append or not Path(path).exists()
         self._sync_path = path
+        if not path:  # SAVE_RAW_AND_D7_ONLY: sync points stay in memory only
+            return
+        new = not append or not Path(path).exists()
         self._sync_file = open(path, "a" if append else "w", newline="", encoding="utf-8")
         self._sync_writer = csv.writer(self._sync_file)
         if new:

@@ -379,15 +379,26 @@ def _fmt(v: float) -> str:
     return f"{v:.4f}"
 
 
+class _NoCsv:
+    """Stands in for a csv.writer when the run keeps only the raw files."""
+
+    def writerow(self, row) -> None:
+        pass
+
+
 class Recorder:
     """Writes one run's PPK2 files. Everything is flushed every few seconds,
-    so a crash late in a 24 h run still leaves the hours before it."""
+    so a crash late in a 24 h run still leaves the hours before it.
+    raw_only: write just ppk_raw/ (no 1 ms/1 s files, anchors, pulses, loss,
+    snippets or ppk_meta.json)."""
 
     def __init__(self, run_dir: Path, rec_start_n: int, raw_csv: bool = False,
-                 warn=None, on_file=None) -> None:
+                 warn=None, on_file=None, raw_only: bool = False) -> None:
         self.dir = Path(run_dir)
+        self.raw_only = raw_only
         self.snip_dir = self.dir / "snippets"
-        self.snip_dir.mkdir(parents=True, exist_ok=True)
+        if not raw_only:
+            self.snip_dir.mkdir(parents=True, exist_ok=True)
         self.rec_start_n = rec_start_n
         self.raw = RawWriter(self.dir, rec_start_n, csv_on=raw_csv,
                              warn=warn or (lambda _text: None), on_file=on_file)
@@ -417,6 +428,8 @@ class Recorder:
         self._last_flush = time.perf_counter()
 
     def _csv(self, name: str, header: List[str]):
+        if self.raw_only:
+            return _NoCsv()
         f = open(self.dir / name, "w", newline="", encoding="utf-8")
         w = csv.writer(f)
         w.writerow(header)
@@ -438,6 +451,8 @@ class Recorder:
             self._last_flush = now
 
     def _write_ms(self, means: np.ndarray) -> None:
+        if self.raw_only:
+            return
         data = means.astype("<f4")
         i = 0
         while i < data.size:
@@ -519,8 +534,9 @@ class Recorder:
             "raw": raw,
         }
         meta.update(extra)
-        with open(self.dir / "ppk_meta.json", "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2)
+        if not self.raw_only:
+            with open(self.dir / "ppk_meta.json", "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2)
         return meta
 
 
@@ -707,7 +723,8 @@ class CaptureWorker:
         self.rec = Recorder(Path(params["run_dir"]), self.n_proc,
                             raw_csv=bool(params.get("raw_csv", False)),
                             warn=lambda text: self._send("warn", text),
-                            on_file=lambda info: self._send("raw_file", info))
+                            on_file=lambda info: self._send("raw_file", info),
+                            raw_only=bool(params.get("raw_only", False)))
         self.pending_snips.clear()
         self._send("rec_started", {"rec_start_n": self.n_proc, "t": time.perf_counter(),
                                    "offset": self.anchors.offset(),
@@ -884,7 +901,7 @@ class CaptureWorker:
     def _on_rise(self, n_rise: int) -> None:
         self.rise_count += 1
         self.rise_numbers[n_rise] = self.rise_count
-        if (self.rec is not None
+        if (self.rec is not None and not self.rec.raw_only
                 and self.rec.snippets + len(self.pending_snips) < self.max_snippets):
             self.pending_snips[n_rise] = self.rise_count
 
