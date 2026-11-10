@@ -1,4 +1,5 @@
 __pycache__/
 *.pyc
 *.npz
+check_time_fall.py
 runs/
