@@ -26,6 +26,7 @@ import csv
 import json
 import multiprocessing as mp
 import queue
+import sys
 import time
 import traceback
 from collections import deque
@@ -88,6 +89,12 @@ class Ppk2Device(PPK2_API):  # type: ignore[misc,valid-type]
 
 def open_device(port: str, vdd_mv: int, dut_on: bool) -> "Ppk2Device":
     """Open the PPK2, load its calibration, set source mode and start streaming."""
+    if PPK2_IMPORT_ERROR:
+        # Without this, Ppk2Device falls back to `object` and fails with the
+        # misleading "Ppk2Device() takes no arguments".
+        raise RuntimeError(f"ppk2-api / pyserial not installed for {sys.executable} "
+                           f"({PPK2_IMPORT_ERROR}). Run the app with `py`, or "
+                           f"`\"{sys.executable}\" -m pip install ppk2-api`")
     ppk = Ppk2Device(port, timeout=1, write_timeout=1)
     try:
         if hasattr(ppk.ser, "set_buffer_size"):
